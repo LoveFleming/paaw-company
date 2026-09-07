@@ -22,6 +22,21 @@
 
 完整清單見 **MANIFEST.txt**（可照著逐一打勾）。
 
+## 🔧 Hotfix 2026-09-07（`72431dc5`）— Linux 放大 icon 修復
+
+Linux 預設字型缺 `⛶`/`🗗` 符號，放大/全螢幕 icon 顯示豆腐框。改用 inline SVG（不依賴系統字型，三平台一致）。
+
+**此批要覆蓋的 4 檔：**
+
+```
+M  packages/ui/src/pages/CodingIDE.tsx      ← coding app 專注模式按鈕（主要回報）
+M  packages/ui/src/pages/BriefingPlayer.tsx ← 簡報全螢幕按鈕（同地雷順手修）
+M  packages/ui/src/pages/AppBuilder.tsx     ← 預覽全螢幕按鈕（同地雷順手修）
+M  packages/ui/src/pages/MindMapViewer.tsx  ← 心智圖「符合視窗」按鈕（同地雷順手修）
+```
+
+> 註：BriefingPlayer / AppBuilder / MindMapViewer 這 3 檔不在 9/4-9/6 更新包內（該期間沒改過），公司端的版本直接覆蓋即可。覆蓋後瀏覽器 hard refresh。
+
 ## 下載方式
 
 GitHub 網頁點開檔案 → 右上 **Raw** → 另存新檔；或直接用 raw URL：

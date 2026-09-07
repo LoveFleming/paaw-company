@@ -1,5 +1,5 @@
 # PAAW Company Update — File Manifest (276 files)
-# 範圍: 2e5b5b76 -> b25f42b4 (2026-09-04 ~ 09-06, 62 commits)
+# 範圍: 2e5b5b76 -> b25f42b4 (2026-09-04 ~ 09-06, 86 commits)
 # 標記: A=核心程式必覆蓋 B=data設定必覆蓋 C=大宗資料 ROOT=根目錄檔
 # 註: data/skills/physical-skill/ 已移除 — 公司端已有，不重複放
 

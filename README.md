@@ -3,7 +3,7 @@
 手動更新包 — 給公司端一個檔案一個檔案下載覆蓋用。
 所有路徑 = **PAAW repo（tPAAW）相對路徑**，下載後放到公司 PAAW 的同一個相對路徑覆蓋即可。
 
-- **來源範圍：** `2e5b5b76`（9/4 20:19）→ `b25f42b4`（9/6 20:57），共 62 commits（dev branch）
+- **來源範圍：** `2e5b5b76`（9/4 20:19）→ `b25f42b4`（9/6 20:57），共 86 commits（dev branch）
 - **已測：** typecheck ✓ / UI build ✓ / 50 route 模組載入 ✓ / API smoke 15 項全過 ✓ / janitor 冪等 ✓
 - **不用 npm install**（無新 dependency）
 

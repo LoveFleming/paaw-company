@@ -37,6 +37,30 @@ M  packages/ui/src/pages/MindMapViewer.tsx  ← 心智圖「符合視窗」按�
 
 > 註：BriefingPlayer / AppBuilder / MindMapViewer 這 3 檔不在 9/4-9/6 更新包內（該期間沒改過），公司端的版本直接覆蓋即可。覆蓋後瀏覽器 hard refresh。
 
+## 📦 2026-09-07 晚 — 打包管線（v1.0.0，tPAAW `1c67a893`）
+
+在公司 Linux 打 `node scripts/pack.mjs` 產 zip 需同步的檔案：
+
+**覆蓋：**
+```
+M  scripts/pack.mjs          ← 打包 script（git-free 掃目錄 + self-check）
+M  package.json              ← 1.0.0（已同步）
+M  .gitignore                ← 已同步
+A  scripts/seed/（29 檔整個目錄）← 出廠骨架（backup.json/agentic-bindings.json 已移除）
+```
+
+**手動刪除：**
+```
+scripts/seed/config/backup.json
+scripts/seed/config/agentic-bindings.json
+data/skills/physical-skill/translate/.paaw/（整個目錄）
+data/apps/sdlc-architect/.paaw/（整個目錄）
+data/skills/building/translate/data/（整個目錄，路徑 bug 產物）
+data/apps/pocket/app.html.bak
+```
+
+**執行前檢查（Linux）：** `which rsync zip`（沒有就 `sudo apt install rsync zip`）→ `node scripts/pack.mjs` → 產出 `dist/paaw-1.0.0.zip` + manifest。seeded 應爲 ~2196 檔、self-check ✓。
+
 ## 下載方式
 
 GitHub 網頁點開檔案 → 右上 **Raw** → 另存新檔；或直接用 raw URL：

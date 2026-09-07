@@ -9,15 +9,16 @@
 
 ---
 
-## 檔案統計（共 680 檔）
+## 檔案統計（共 276 檔）
 
 | 分類 | 數量 | 說明 |
 |------|------|------|
 | A. `packages/` 核心程式 | 89 | server 55 + UI 34 — **全部要覆蓋** |
-| B. `data/` 設定檔 | 20 | crews ×10、notebooks ×1、CU prompts ×4、skills SKILL.md ×5 — **全部要覆蓋** |
-| C-1. Go semgrep 規則 | 169 | `data/semgrep-rules/golang/` — Go 掃描功能需要 |
-| C-2. Skill library 擴充 | 399 | `data/skills/physical-skill/` 新技能（62 個技能） |
+| B. `data/` 設定檔 | 15 | crews ×10、notebooks ×1、CU prompts ×4 — **全部要覆蓋** |
+| C. Go semgrep 規則 | 169 | `data/semgrep-rules/golang/` — Go 掃描功能需要 |
 | ROOT | 3 | `package.json`（+start/typecheck scripts）、`.gitignore`、coding spec 文件 |
+
+> `data/skills/physical-skill/`（399 新技能 + 5 個更新 SKILL.md）已移除 — 公司端已有，不重複放。若需要那 5 個更新的 SKILL.md（code-documenter / code-reviewer / debugging-wizard / sre-engineer / test-master），另外跟管家要。
 
 完整清單見 **MANIFEST.txt**（可照著逐一打勾）。
 

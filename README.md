@@ -11,14 +11,15 @@
 
 ---
 
-## 檔案統計（共 276 檔）
+## 檔案統計（共 107 檔）
 
 | 分類 | 數量 | 說明 |
 |------|------|------|
 | A. `packages/` 核心程式 | 89 | server 55 + UI 34 — **全部要覆蓋** |
 | B. `data/` 設定檔 | 15 | crews ×10、notebooks ×1、CU prompts ×4 — **全部要覆蓋** |
-| C. Go semgrep 規則 | 169 | `data/semgrep-rules/golang/` — Go 掃描功能需要 |
 | ROOT | 3 | `package.json`（+start/typecheck scripts）、`.gitignore`、coding spec 文件 |
+
+> 🗑️ `data/semgrep-rules/golang/`（169 檔）已於 2026-09-08 移除 — 公司端不需要從這邊下載。
 
 > `data/skills/physical-skill/`（399 新技能 + 5 個更新 SKILL.md）已移除 — 公司端已有，不重複放。若需要那 5 個更新的 SKILL.md（code-documenter / code-reviewer / debugging-wizard / sre-engineer / test-master），另外跟管家要。
 

@@ -9,9 +9,10 @@
 ## 覆蓋清單（本批 4 檔，tPAAW 相對路徑）
 
 ```
-M  packages/server/src/routes/a2a.mjs           ← streamStates registry 攔截 SSE buffer；GET /a2a/:agentId/stream-state 接回進度/最終回覆；client 斷線不 abort；完成後 server 落地回覆（TTL 15min）
+M  packages/server/src/routes/a2a.mjs           ← streamStates registry（批次3 更新：onStreamEvent 側車 274c8428） 攔截 SSE buffer；GET /a2a/:agentId/stream-state 接回進度/最終回覆；client 斷線不 abort；完成後 server 落地回覆（TTL 15min）
 M  packages/server/src/websocket/ws-handler.mjs ← spawn 支援 resumeSessionId（10min TTL），resume 保留 history、事件送新 ws；kill 明確 drop resumable
 M  packages/ui/src/components/AgentConsole.tsx  ← WS auto-reconnect（1s 起 backoff 上限 15s）+ sessionStorage 記 session id + resume 帶回 history；restartSession 清 resume 痕跡
+M  packages/server/src/lib/paaw-agent-loop.mjs  ← runAgentLoopStream 新增 onStreamEvent hook（res.destroyed 後仍 buffer — 實測抓到的漏事件 bug）
 M  packages/ui/src/pages/CodingIDE.tsx          ← developer chat 斷線後輪詢 stream-state（3s），done 補 finalContent、執行中顯示最新動作；dedupe 防雙落地重複
 ```
 

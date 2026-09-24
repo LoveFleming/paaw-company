@@ -1,5 +1,5 @@
 /**
- * PAAW Agent Loop — Self-owned runtime for AI coding tasks
+ * PAAW Agent Loop - Self-owned runtime for AI coding tasks
  *
  * Replaces external CLI agents (qwen code, opencode, claude code) with a
  * lightweight tool-calling loop that runs against PAAW's configured LLM API.
@@ -19,6 +19,7 @@
  */
 
 import { readFile, writeFile, readdir, stat, mkdir, rm } from "fs/promises";
+import { cleanupProjectTempFiles } from "./temp-janitor.mjs";
 import { existsSync, readFileSync as readSync, mkdirSync, appendFileSync, writeFileSync as writeSync, readdirSync, statSync } from "fs";
 import { loadFeatureData, matchFeaturesForFiles, buildContextBoundary } from "./feature-boundary.mjs";
 import { exec as execCb } from "child_process";
@@ -39,12 +40,13 @@ import { messagesForModel, isVisionModel, hasImages, extractImageMarkers, buildI
 import { startAgentLog } from "./agent-exec-logger.mjs";
 import { createPaawProject } from "./paaw-project.mjs";
 import { PaawSnapshot } from "./paaw-snapshot.mjs";
-import { resolveDefaultModel } from "./llm-utils.mjs";
+import { resolveDefaultModel, parseModelReference, jsonStringifySafe, cutSafeStart } from "./llm-utils.mjs";
 import { toolRegistry } from "./tool-registry.mjs";
 import { DATA_HOME, LOG_HOME, logSlug } from "../data-home.mjs";
 import {
   getBrowserPage, takeScreenshot, trackPage, readPageText, locateTarget,
-  assertSafeUrl, browserState, PLAYWRIGHT_INSTALL_HINT,
+  assertSafeUrl, browserState, PLAYWRIGHT_INSTALL_HINT, resolveBrowserKey,
+  recordBrowserAction, takeActionShot, browserShotDir, getVisualMode, visualClick,
 } from "./browser-session.mjs";
 
 // ── Types ──
@@ -74,7 +76,7 @@ import {
  */
 
 // ── Provider Resolution ──
-// providers.json is a PAAW server config file — always read from PAAW_ROOT,
+// providers.json is a PAAW server config file - always read from PAAW_ROOT,
 // never from an arbitrary project cwd. The bug was that rootDir (which
 // could be any project path) was used to find providers.json.
 
@@ -91,7 +93,7 @@ function loadProviderConfig() {
 
 export function resolveLLMConfig(_rootDir, modelOverride, fallbackModels) {
   const config = loadProviderConfig();
-  if (!config) throw new Error("No provider config found — checked: " + resolve(DATA_HOME, "config/providers.json"));
+  if (!config) throw new Error("No provider config found - checked: " + resolve(DATA_HOME, "config/providers.json"));
 
   // Auto-read fallback preferences from user.json if no explicit fallbackModels
   if (!fallbackModels || fallbackModels.length === 0) {
@@ -107,18 +109,11 @@ export function resolveLLMConfig(_rootDir, modelOverride, fallbackModels) {
   }
 
   // Parse "providerId/modelId" format (from ModelSelector)
-  // Only split if providerId portion exists in providers config
+  // 2026-09-14 fix:改用 parseModelReference - model id 自帶 provider prefix(如 anthropic/claude-opus-4.8)
+  // 不再被剝過頭(first-slash 剝成 claude-opus-4.8 → LLM API 400 unknown model)
   let providerId = config.active;
   let model = modelOverride || resolveDefaultModel(config);
-  if (model && model.includes("/")) {
-    const firstSlash = model.indexOf("/");
-    const candidateProvider = model.slice(0, firstSlash);
-    if (config.providers[candidateProvider]) {
-      providerId = candidateProvider;
-      model = model.slice(firstSlash + 1);
-    }
-    // Otherwise keep the full model string (e.g. "deepseek/deepseek-v4-flash" via openrouter)
-  }
+  ({ providerId, model } = parseModelReference(config, model));
 
   const provider = config.providers[providerId];
   if (!provider) throw new Error(`Provider '${providerId}' not found`);
@@ -137,23 +132,16 @@ export function resolveLLMConfig(_rootDir, modelOverride, fallbackModels) {
     headers["X-Title"] = "PAAW";
   }
 
-  // Build fallback chain — priority: caller-supplied fallbackModels > providers.json fallbacks > hardcoded
+  // Build fallback chain - priority: caller-supplied fallbackModels > providers.json fallbacks > hardcoded
   const fallbacks = [];
 
   // 1. Caller-supplied fallback models (e.g. from user.json preferences or request body)
   if (fallbackModels && fallbackModels.length > 0) {
     for (const fbModel of fallbackModels) {
-      // Parse "providerId/modelId" format
-      let fbProviderId = config.active;
-      let fbModelId = fbModel;
-      if (fbModel && fbModel.includes("/")) {
-        const firstSlash = fbModel.indexOf("/");
-        const candidate = fbModel.slice(0, firstSlash);
-        if (config.providers[candidate]) {
-          fbProviderId = candidate;
-          fbModelId = fbModel.slice(firstSlash + 1);
-        }
-      }
+      // Parse "providerId/modelId" format - 2026-09-14 同 parseModelReference(full-path model id 不剝過頭)
+      const fbRef = parseModelReference(config, fbModel);
+      const fbProviderId = fbRef.providerId;
+      const fbModelId = fbRef.model;
       const fbProvider = config.providers[fbProviderId];
       if (!fbProvider) continue;
       const fbHeaders = { "Content-Type": "application/json", Authorization: `Bearer ${fbProvider.apiKey}` };
@@ -179,7 +167,7 @@ export function resolveLLMConfig(_rootDir, modelOverride, fallbackModels) {
   }
 
   // 3. Auto-build fallback from other providers' model lists (only if nothing else provided)
-  // Uses each provider's first model — never references a model name not in that provider's list
+  // Uses each provider's first model - never references a model name not in that provider's list
   if (fallbacks.length === 0) {
     for (const [pid, p] of Object.entries(config.providers)) {
       if (pid === providerId) continue; // skip active provider
@@ -201,7 +189,7 @@ export function resolveLLMConfig(_rootDir, modelOverride, fallbackModels) {
   // In that case, modelDef is undefined and we use generous defaults
   const modelDef = (provider.models || []).find(m => m.id === model);
   if (!modelDef) {
-    console.log(`[resolveLLMConfig] Model "${model}" not in provider's model list — using defaults (contextWindow=${DEFAULT_CONTEXT_WINDOW})`);
+    console.log(`[resolveLLMConfig] Model "${model}" not in provider's model list - using defaults (contextWindow=${DEFAULT_CONTEXT_WINDOW})`);
   }
   const contextWindow = modelDef?.contextWindow || DEFAULT_CONTEXT_WINDOW;
   const maxTokens = modelDef?.maxTokens || 16384;
@@ -307,7 +295,7 @@ export const PAAW_TOOLS = [
         type: "object",
         properties: {
           path: { type: "string", description: "File or directory to diff (for git diff)" },
-          against: { type: "string", description: "Git ref to diff against (e.g. 'HEAD', 'main', 'dev') — defaults to working tree vs HEAD" },
+          against: { type: "string", description: "Git ref to diff against (e.g. 'HEAD', 'main', 'dev') - defaults to working tree vs HEAD" },
           file_a: { type: "string", description: "First file path (for file-to-file diff)" },
           file_b: { type: "string", description: "Second file path (for file-to-file diff)" },
         },
@@ -334,7 +322,7 @@ export const PAAW_TOOLS = [
     type: "function",
     function: {
       name: "bash",
-      description: "Run a shell command and return stdout/stderr. Use for build, test, install, npm, pip, and any general shell operations. Timeout default: 30s.",
+      description: "Run a shell command and return stdout/stderr. Use for build, test, install, npm, pip, and any general shell operations. Timeout default: 30s. PROCESS RULE (hard-enforced): you may only manage the CURRENT release unit's dev server via the dev_server tool - pkill/killall/taskkill are blocked, kill only allows this RU's tracked dev-server pid, and the PAAW coding app itself (paaw-server, tPAAW vite, ports 4097/4098/4100/5173) must NEVER be started or stopped.",
       parameters: {
         type: "object",
         properties: {
@@ -342,6 +330,40 @@ export const PAAW_TOOLS = [
           timeout: { type: "number", description: "Timeout in seconds (default: 30, max: 120)" },
         },
         required: ["command"],
+      },
+    },
+  },
+
+  // ── Dev Server Controller(2026-09-10 Phase 1)──
+  {
+    type: "function",
+    function: {
+      name: "dev_server",
+      description: "Manage this Release Unit's dev server (long-running process like `npm run dev` or `mvn spring-boot:run`). Detached background process - returns immediately, survives the agent session. Output goes to log/app-console/<ru>/app-console-YYYY-MM-DD.log which the human watches live in CodingIDE Terminal → Console → App view. Actions: start / stop / restart / status. restart has a crash-loop guard (max 5 per 10min). Hard-scoped to the CURRENT RU only - outside processes and the PAAW coding app itself can never be touched here. CRITICAL: after start/restart, ALWAYS call dev_log to verify the server actually booted (look for port listening / errors) before claiming success.",
+      parameters: {
+        type: "object",
+        properties: {
+          action: { type: "string", enum: ["start", "stop", "restart", "status"], description: "What to do" },
+          command: { type: "string", description: "Command to run for start/restart (default: npm run dev). Ignored for stop/status." },
+        },
+        required: ["action"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "dev_log",
+      description: "Read this Release Unit's app console log (dev server output, app stdout/stderr). Use after dev_server start/restart to verify boot, or when debugging runtime issues. Modes: (1) plain tail - last N lines; (2) grep=KEYWORD - filter lines containing keyword (e.g. grep=error, grep=EADDRINUSE) and show the last N matches - the fastest way to find dev-time problems; (3) date=YYYY-MM-DD - read a specific day's log (history); (4) list=true - list available log files. Same source as the human's CodingIDE Terminal → Console → App view.",
+      parameters: {
+        type: "object",
+        properties: {
+          lines: { type: "number", description: "Number of tail lines / matches to return (default 100, max 400)" },
+          grep: { type: "string", description: "Keyword filter (case-insensitive substring) - e.g. \"error\", \"exception\", \"fail\" to find dev-time problems fast" },
+          date: { type: "string", description: "Read a specific day's log file (YYYY-MM-DD). Default: latest." },
+          list: { type: "boolean", description: "List available log files (dates + sizes) instead of reading" },
+        },
+        required: [],
       },
     },
   },
@@ -377,12 +399,36 @@ export const PAAW_TOOLS = [
       },
     },
   },
+  // ── API Tester(2026-09-12 Fleming:developer agent 可用 API Tester,紀錄進 UI 歷史)──
+  {
+    type: "function",
+    function: {
+      name: "api_test",
+      description: "Send an HTTP request via the built-in API Tester - same as the human's 🌐 API Tester tab. Every call is saved to the shared API Tester history (📜 in UI) with a 🤖 agent marker, so the human sees what you tested and can replay it. Use this instead of bash curl for API testing. Collections (2026-09-24): (1) listCollections=true lists all collections and their payloads; (2) run a saved payload by collection+name without url; (3) save=true with collection+name+method+url(+headers/body) saves a payload into a collection so the human can replay/organize it in the Collections tab - use this when the human asks you to add API test payloads. E2E workflow (tester): use project_info category=api_history to look up past requests (source=human shows what the human manually tested - detail=<N> returns the full headers/body they entered), then use those real payloads as seed data for e2e Playwright scripts, and use api_test to verify each API call the script will make.",
+      parameters: {
+        type: "object",
+        properties: {
+          method: { type: "string", enum: ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"], description: "HTTP method (default GET)" },
+          url: { type: "string", description: "Full URL to request (e.g. http://localhost:4318/api/crew). Omit when running a saved payload via collection+name" },
+          headers: { type: "object", description: "Request headers as key-value object (e.g. {\"Content-Type\":\"application/json\", \"Authorization\":\"Bearer x\"})" },
+          body: { type: "string", description: "Request body (send JSON as string)" },
+          collection: { type: "string", description: "Collection name - with name: run that saved payload; with save=true: target collection to store into" },
+          name: { type: "string", description: "Payload name within the collection" },
+          save: { type: "boolean", description: "true = save this request (method/url/headers/body) into collection+name instead of sending it. Overwrites same-name payload" },
+          listCollections: { type: "boolean", description: "true = list all collections with their payloads (names/methods/urls)" },
+          expectStatus: { type: "number", description: "Expected HTTP status code - report ✅/❌ pass/fail" },
+          expectText: { type: "string", description: "Text expected in response body - report ✅/❌ pass/fail" },
+        },
+        required: [],
+      },
+    },
+  },
   // ── Real Browser Tools (Playwright, JS-rendered pages, docs lookup, UI self-verification) ──
   {
     type: "function",
     function: {
       name: "browser_navigate",
-      description: "Open a URL in the built-in headless Chromium browser (JS-rendered pages supported, unlike browser_test). Use for reading docs, npm/GitHub pages, or opening the local dev server preview to verify UI you built. Login sessions persist across runs. Returns page title + text excerpt.",
+      description: "Open a URL in the built-in headless Chromium browser (JS-rendered pages supported, unlike browser_test). Use for reading docs, npm/GitHub pages, or opening the local dev server preview to verify UI you built. Login sessions persist across runs. Returns page title + text excerpt. IMPORTANT: this browser is bound to the current release unit - open THE RELEASE UNIT'S own web pages (e.g. its dev server), NEVER the PAAW coding app's own UI. The human watches your steps as recorded replays, so navigate deliberately.",
       parameters: {
         type: "object",
         properties: {
@@ -446,6 +492,23 @@ export const PAAW_TOOLS = [
       },
     },
   },
+  // 2026-09-12 Fleming:下拉式選單(native <select>)agent 竒操作 - 搭配 screencast 客製面板
+  {
+    type: "function",
+    function: {
+      name: "browser_select",
+      description: "Select an option in a native <select> dropdown on the current browser page. Provide the CSS selector of the <select> and either the visible option label or the option value. Returns page text excerpt after selecting.",
+      parameters: {
+        type: "object",
+        properties: {
+          selector: { type: "string", description: "CSS selector of the <select> element (e.g. \"select#country\", \"select[name=locale]\")" },
+          label: { type: "string", description: "Visible text of the option to select (e.g. \"Taiwan\")" },
+          value: { type: "string", description: "Value attribute of the option to select" },
+        },
+        required: ["selector"],
+      },
+    },
+  },
     {
       type: "function",
       function: {
@@ -463,20 +526,165 @@ export const PAAW_TOOLS = [
         },
       },
     },
+    // ── QA Results - QA 記錄共享存儲(2026-09-17 Fleming:qa agent 留記錄、其他 agent 讀寫)──
+    {
+      type: "function",
+      function: {
+        name: "qa_record_save",
+        description: "Save a QA result record to the shared QA log (.paaw/coding-memory/qa-results.jsonl) - visible to ALL agents and the human. Use after ANY testing/verification work: browser QA, smoke test, API test, code review verdict, e2e run. Records verdict (pass/fail), issues found (with severity + evidence like screenshot paths), and links to task/feature. This is the team's QA memory - ALWAYS record your test results here, never let them evaporate into chat history.",
+        parameters: {
+          type: "object",
+          properties: {
+            verdict: { type: "string", enum: ["pass", "fail", "warn", "blocked"], description: "Test verdict" },
+            target: { type: "string", description: "What was tested (page/feature/API name, e.g. 'Login - RBAC redirect')" },
+            summary: { type: "string", description: "One-paragraph conclusion of the test" },
+            type: { type: "string", enum: ["browser", "smoke", "api", "review", "e2e", "manual"], description: "Test type" },
+            url: { type: "string", description: "Tested URL (if applicable)" },
+            taskId: { type: "string", description: "Related task id in the task pipeline (if applicable)" },
+            feature: { type: "string", description: "Related feature name (if applicable)" },
+            issues: {
+              type: "array",
+              description: "Issues found (empty for pass)",
+              items: {
+                type: "object",
+                properties: {
+                  severity: { type: "string", enum: ["critical", "major", "minor"] },
+                  desc: { type: "string", description: "Issue description" },
+                  evidence: { type: "string", description: "Evidence path (screenshot path, log line, API response)" },
+                },
+                required: ["desc"],
+              },
+            },
+            evidence: { type: "array", items: { type: "string" }, description: "Evidence references (screenshot paths, api-tester ids)" },
+            durationMs: { type: "number", description: "Test duration in ms (if known)" },
+          },
+          required: ["verdict", "target", "summary"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "qa_record_list",
+        description: "Search the shared QA results log (.paaw/coding-memory/qa-results.jsonl). Use before retesting (check what was already tested and its verdict), when fixing a bug (find related open issues), or when the human asks about QA status/history. Returns records newest-first with id, verdict, target, summary, open issues.",
+        parameters: {
+          type: "object",
+          properties: {
+            verdict: { type: "string", enum: ["pass", "fail", "warn", "blocked"] },
+            status: { type: "string", enum: ["open", "resolved", "wontfix"], description: "Filter by record status (open = has unresolved issues)" },
+            actor: { type: "string", description: "Filter by who recorded it (qa/tester/developer/...)" },
+            taskId: { type: "string" },
+            feature: { type: "string" },
+            q: { type: "string", description: "Free-text search in target/summary/issues" },
+            limit: { type: "number", description: "Max records (default 10)" },
+          },
+          required: [],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "qa_record_update",
+        description: "Update an existing QA result record - mark an issue resolved/wontfix (after fixing it), change record status, or append a note (goes into history trail). Get the id from qa_record_list.",
+        parameters: {
+          type: "object",
+          properties: {
+            id: { type: "string", description: "Record id (qr-...)" },
+            issueIndex: { type: "number", description: "Issue index to update (0-based, from list output)" },
+            issueStatus: { type: "string", enum: ["resolved", "wontfix", "open"] },
+            status: { type: "string", enum: ["open", "resolved", "wontfix"], description: "Override record-level status (default: auto-resolved when all issues resolved)" },
+            note: { type: "string", description: "Note for the history trail (e.g. 'fixed in commit abc123')" },
+          },
+          required: ["id"],
+        },
+      },
+    },
+    // ── Release Requests - v3(2026-09-18):RM agent 審 RR 證據、建議 verdict,人類做最終決定 ──
+    {
+      type: "function",
+      function: {
+        name: "rr_list",
+        description: "List release requests (RR) for this project - the formal batch-release path. Returns id, title, status (draft/reviewing/released/cancelled), baseline→target, scope counts, checklist verdicts. Use when the human asks about release requests or which RR is in review.",
+        parameters: {
+          type: "object",
+          properties: {
+            status: { type: "string", enum: ["draft", "reviewing", "released", "cancelled"], description: "Filter by status" },
+          },
+          required: [],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "rr_get",
+        description: "Get ONE release request with full evidence: scope (commits/files/features/APIs/tasks) + checklist with deterministic auto-check details (tests run numbers, gates status, open QA fails, risk reasons). Use BEFORE suggesting verdicts - your suggestions must be grounded in this evidence (No answer without evidence).",
+        parameters: {
+          type: "object",
+          properties: {
+            id: { type: "string", description: "RR id (RR-...), from rr_list" },
+          },
+          required: ["id"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "rr_suggest",
+        description: "Write suggested verdicts for a release request's checklist items (pass/fail/waived + reason each). This records SUGGESTIONS ONLY - the human confirms in the Release Manager UI; you never decide a release. Every suggestion MUST have a reason grounded in rr_get evidence. waive suggestions need a justification of why it is safe to ship despite the signal.",
+        parameters: {
+          type: "object",
+          properties: {
+            id: { type: "string", description: "RR id (RR-...)" },
+            items: {
+              type: "array",
+              description: "One entry per checklist item you want to suggest on",
+              items: {
+                type: "object",
+                properties: {
+                  itemId: { type: "string", enum: ["tests", "gates", "qa-records", "risk"], description: "Checklist item id" },
+                  verdict: { type: "string", enum: ["pass", "fail", "waived"], description: "Suggested verdict" },
+                  reason: { type: "string", description: "Why - grounded in rr_get evidence (required)" },
+                },
+                required: ["itemId", "verdict", "reason"],
+              },
+            },
+          },
+          required: ["id", "items"],
+        },
+      },
+    },
+    {
+      type: "function",
+      function: {
+        name: "rr_create",
+        description: "Create a NEW release request (RR) in draft status - the formal batch-release path. Baseline auto-resolves (last release > first commit). Agent may create the draft and review evidence, but NEVER apply/confirm/close - sign-off is human-only in the Release Manager UI. Refuses if a draft/reviewing RR already exists (use that one).",
+        parameters: {
+          type: "object",
+          properties: {
+            title: { type: "string", description: "RR title, e.g. 'tpaaw-gateway 0.2.1 - Server Log 面板 + ISS-001'. Auto-generated if omitted." },
+            baseline: { type: "string", enum: ["auto", "first-commit", "last-release"], description: "Baseline resolution (default auto)" },
+          },
+          required: [],
+        },
+      },
+    },
     // ── Unified docs tool (replaces update_changelog + update_docs) ──
     {
       type: "function",
       function: {
         name: "docs",
-        description: "管理 .paaw/ 文件：更新 changelog、寫入/更新文件。用 action 指定操作。",
+        description: "管理 .paaw/ 文件:更新 changelog、寫入/更新文件。用 action 指定操作。",
         parameters: {
           type: "object",
           properties: {
             action: { type: "string", enum: ["changelog", "write", "append"], description: "changelog=加 changelog 條目, write=寫入文件, append=追加內容" },
-            type: { type: "string", enum: ["added", "changed", "fixed", "removed", "deprecated"], description: "Changelog 類別（action=changelog 時必填）" },
-            description: { type: "string", description: "Changelog 描述（action=changelog）或文件摘要" },
-            file: { type: "string", description: "檔案名（action=write/append 時必填，如 PROJECT.md）" },
-            content: { type: "string", description: "文件內容（action=write/append 時必填）" },
+            type: { type: "string", enum: ["added", "changed", "fixed", "removed", "deprecated"], description: "Changelog 類別(action=changelog 時必填)" },
+            description: { type: "string", description: "Changelog 描述(action=changelog)或文件摘要" },
+            file: { type: "string", description: "檔案名(action=write/append 時必填,如 PROJECT.md)" },
+            content: { type: "string", description: "文件內容(action=write/append 時必填)" },
           },
           required: ["action"],
         },
@@ -487,11 +695,11 @@ export const PAAW_TOOLS = [
       type: "function",
       function: {
         name: "staged_summary",
-        description: "記錄你這輪做了什麼、為什麼、怎麼測試。每次 git add / commit 前必須呼叫此工具（人類和 QA Agent 在 Git tab 看這份摘要決定可不可以 push）。",
+        description: "記錄你這輪做了什麼、為什麼、怎麼測試。每次 git add / commit 前必須呼叫此工具(人類和 QA Agent 在 Git tab 看這份摘要決定可不可以 push)。",
         parameters: {
           type: "object",
           properties: {
-            task: { type: "string", description: "原始任務描述（人類叫你做什麼）" },
+            task: { type: "string", description: "原始任務描述(人類叫你做什麼)" },
             summary: { type: "string", description: "Work Summary 完整內容" },
             files: {
               type: "array",
@@ -499,14 +707,14 @@ export const PAAW_TOOLS = [
                 type: "object",
                 properties: {
                   path: { type: "string", description: "檔案路徑" },
-                  reason: { type: "string", description: "這個檔案為什麼改，一句話" },
+                  reason: { type: "string", description: "這個檔案為什麼改,一句話" },
                 },
                 required: ["path", "reason"],
               },
               description: "你改了哪些檔案 + 每個檔案為什麼改",
             },
-            howToTest: { type: "string", description: "具體測試步驟，讓非寫碼的人也能照著做" },
-            risk: { type: "string", description: "風險注意，沒有寫「無」" },
+            howToTest: { type: "string", description: "具體測試步驟,讓非寫碼的人也能照著做" },
+            risk: { type: "string", description: "風險注意,沒有寫「無」" },
           },
           required: ["task", "summary", "files", "howToTest"],
         },
@@ -523,10 +731,10 @@ export const PAAW_TOOLS = [
           category: {
             type: "string",
             enum: ["context", "issues", "features", "feature_detail", "runbook", "sessions", "test_map", "recent_changes", "api_history", "project_read", "error_codes", "c4_model", "security", "decisions", "changelog"],
-            description: "What to query: context=project overview (PROJECT.md+feature map), features=feature map, feature_detail=single feature, runbook=troubleshooting, sessions=work sessions, test_map=test intelligence, recent_changes=change intelligence, api_history=API tester logs, project_read=human-written PROJECT.md, error_codes=error codes by feature（寫碼前查既有 codes 不重複；debug 時帶 search=錯誤碼/訊息穩定片段反查 feature+file:line；帶 feature 看單一 feature）， c4_model=C4 對外連線全景（containers/external systems/relationships；帶 search 查特定服務）, security=security scan findings 明細（file:line + CWE + snippet + feature 對應；QA/SA 看 security 結果與開 task 的入口；帶 severity/file/search 過濾）, decisions=架構決策記錄 DECISIONS.md（ADR 清單與内文）, changelog=CHANGELOG.md 版本變更記錄"
+            description: "What to query: context=專案全貌（Feature Map + file→feature mapping + 自動摘要）— 了解專案/定位功能的第一步, features=feature map, feature_detail=single feature, runbook=troubleshooting, sessions=work sessions, test_map=test intelligence, recent_changes=change intelligence, api_history=API tester logs, project_read=PROJECT.md 全文（CU 自動初稿或人寫筆記，可能過期；以 feature map 為準）, error_codes=error codes by feature（寫碼前查既有 codes 不重複；debug 時帶 search=錯誤碼/訊息穩定片段反查 feature+file:line；帶 feature 看單一 feature）, c4_model=C4 對外連線全景（containers/external systems/relationships；帶 search 查特定服務）, security=security scan findings 明細（file:line + CWE + snippet + feature 對應；QA/SA 看 security 結果與開 task 的入口；帶 severity/file/search 過濾）, decisions=架構決策記錄 DECISIONS.md（ADR 清單與内文）, changelog=CHANGELOG.md 版本變更記錄"
           },
-          id: { type: "string", description: "Feature/issue ID (正式格式 F{YYYYMMDD}-{NNN}，如 F20260904-001；issue 為 ISS-001). 一律用 project_info 查現況，勿自編. Used with category=feature_detail." },
-          search: { type: "string", description: "Search keyword. Used with: features (by name), runbook (by content), faq (by keyword), error_codes (錯誤碼/訊息片段反查 — debug 入口), c4_model (服務名/技術，如 redis)." },
+          id: { type: "string", description: "Feature/issue ID (正式格式 F{YYYYMMDD}-{NNN},如 F20260904-001;issue 為 ISS-001). 一律用 project_info 查現況,勿自編. Used with category=feature_detail." },
+          search: { type: "string", description: "Search keyword. Used with: features (by name), runbook (by content), faq (by keyword), error_codes (錯誤碼/訊息片段反查 - debug 入口), c4_model (服務名/技術,如 redis)." },
           code: { type: "string", description: "Error code for runbook lookup (e.g. ORD-001)." },
           name: { type: "string", description: "Standard name to read (for category=standards). If omitted, lists all." },
           status: { type: "string", description: "Filter issues by status (comma-separated): open,in-progress,resolved,closed,wontfix." },
@@ -537,6 +745,8 @@ export const PAAW_TOOLS = [
           days: { type: "number", description: "Days back for recent_changes (default: 30)." },
           limit: { type: "number", description: "Max results for sessions/api_history (default: 5/20)." },
           method: { type: "string", description: "Filter api_history by HTTP method." },
+          source: { type: "string", enum: ["human", "agent"], description: "Filter api_history by who ran it: human (manually in API Tester UI) or agent (via api_test tool)." },
+          detail: { type: "string", description: "api_history only: entry number (1-based) or req-id - returns the FULL request (headers/body/response) for e2e script generation." },
           path_contains: { type: "string", description: "Filter api_history by URL substring." },
           include_response: { type: "boolean", description: "Include response body in api_history (default: true)." },
         },
@@ -560,7 +770,7 @@ export const PAAW_TOOLS = [
             description: "Mutation action to perform",
           },
           // ── Issue create/update/delete ──
-          id: { type: "string", description: "Issue/feature ID (ISS-001；feature 正式格式 F{YYYYMMDD}-{NNN} 如 F20260904-001，勿自編)" },
+          id: { type: "string", description: "Issue/feature ID (ISS-001;feature 正式格式 F{YYYYMMDD}-{NNN} 如 F20260904-001,勿自編)" },
           title: { type: "string", description: "Issue title or change title" },
           priority: { type: "string", enum: ["critical", "high", "medium", "low"], description: "Priority" },
           status: { type: "string", enum: ["open", "in-progress", "resolved", "closed", "wontfix"], description: "Issue status" },
@@ -587,12 +797,12 @@ export const PAAW_TOOLS = [
     },
   },
 
-  // ── Project Board tool（維護 data/projects/ 的專案看板 — 一個 release unit 對應一個 project）──
+  // ── Project Board tool(維護 data/projects/ 的專案看板 - 一個 release unit 對應一個 project)──
   {
     type: "function",
     function: {
       name: "project_board",
-      description: "維護 PAAW Project Board（data/projects/）。一個 release unit 對應一個 project。新 RU 開始時用 create 建 project，之後用 task_create/task_update 維護任務進度。",
+      description: "維護 PAAW Project Board(data/projects/)。一個 release unit 對應一個 project。新 RU 開始時用 create 建 project,之後用 task_create/task_update 維護任務進度。",
       parameters: {
         type: "object",
         properties: {
@@ -601,19 +811,19 @@ export const PAAW_TOOLS = [
             enum: ["status", "create", "update", "category_create", "task_create", "task_update", "milestone_create"],
             description: "status=查看全部專案現況, create=建新 project(新 RU), update=改專案欄位, category_create=加分類, task_create=加任務, task_update=改任務, milestone_create=加里程碑",
           },
-          projectId: { type: "string", description: "目標 project ID（status/create 以外必填）" },
+          projectId: { type: "string", description: "目標 project ID(status/create 以外必填)" },
           // create / update
-          id: { type: "string", description: "(create) 新 project ID，英文小寫" },
-          name: { type: "string", description: "(create/update) 專案名稱；task_create/task_update 為任務名稱" },
+          id: { type: "string", description: "(create) 新 project ID,英文小寫" },
+          name: { type: "string", description: "(create/update) 專案名稱;task_create/task_update 為任務名稱" },
           icon: { type: "string", description: "(create/category_create) emoji icon" },
           description: { type: "string", description: "(create/update/category_create) 描述" },
-          status: { type: "string", description: "(update) planning|in-progress|completed|on-hold|cancelled；(task_update) todo|progress|done" },
+          status: { type: "string", description: "(update) planning|in-progress|completed|on-hold|cancelled;(task_update) todo|progress|done" },
           startDate: { type: "string", description: "(create) YYYY-MM-DD" },
           targetDate: { type: "string", description: "(create/update) YYYY-MM-DD" },
           repo: { type: "string", description: "(create) GitHub repo URL" },
-          aliases: { type: "array", items: { type: "string" }, description: "(create) 本機資料夾名 alias（跨機器對應 RU 用，例如 ['tPAAW']）" },
+          aliases: { type: "array", items: { type: "string" }, description: "(create) 本機資料夾名 alias(跨機器對應 RU 用,例如 ['tPAAW'])" },
           // category
-          categoryId: { type: "string", description: "(task_create) 放進哪個分類，省略放第一個" },
+          categoryId: { type: "string", description: "(task_create) 放進哪個分類,省略放第一個" },
           // task
           taskId: { type: "string", description: "(task_update) 任務 ID" },
           priority: { type: "string", enum: ["high", "medium", "low"], description: "(task_create/task_update) 優先級" },
@@ -651,7 +861,7 @@ export const PAAW_TOOLS = [
     type: "function",
     function: {
       name: "action_log_add",
-      description: "Record your action to the project action log. This is the handoff log between agents — write after completing a task so other agents know what you did.",
+      description: "Record your action to the project action log. This is the handoff log between agents - write after completing a task so other agents know what you did.",
       parameters: {
         type: "object",
         properties: {
@@ -670,7 +880,7 @@ export const PAAW_TOOLS = [
     type: "function",
     function: {
       name: "action_log_list",
-      description: "Read recent action log entries. This shows what other agents (and you) have done recently — the project handoff log.",
+      description: "Read recent action log entries. This shows what other agents (and you) have done recently - the project handoff log.",
       parameters: {
         type: "object",
         properties: {
@@ -707,19 +917,19 @@ export const PAAW_TOOLS = [
       },
     },
   },
-  // ── Conversation History（2026-09-06 Fleming：每個 agent 都能查過去聊天記錄，RU 開發紀錄全保留）──
+  // ── Conversation History(2026-09-06 Fleming:每個 agent 都能查過去聊天記錄,RU 開發紀錄全保留)──
   {
     type: "function",
     function: {
       name: "conversation_history",
-      description: "查過去的聊天記錄（跨 session，含已封存）。action: list=列出自己的對話 sessions；load=讀某 session 完整內容；search=關鍵字搜尋對話（預設搜全部 agent）。找「之前聊過什麼、決定了什麼」用這個。",
+      description: "查過去的聊天記錄(跨 session,含已封存)。action: list=列出自己的對話 sessions;load=讀某 session 完整內容;search=關鍵字搜尋對話(預設搜全部 agent)。找「之前聊過什麼、決定了什麼」用這個。",
       parameters: {
         type: "object",
         properties: {
-          action: { type: "string", enum: ["list", "load", "search"], description: "list=列出 sessions；load=讀完整對話；search=關鍵字搜尋" },
-          sessionId: { type: "string", description: "load 時要讀的 session id（來自 list 結果；active=目前對話）" },
+          action: { type: "string", enum: ["list", "load", "search"], description: "list=列出 sessions;load=讀完整對話;search=關鍵字搜尋" },
+          sessionId: { type: "string", description: "load 時要讀的 session id(來自 list 結果;active=目前對話)" },
           query: { type: "string", description: "search 時的關鍵字" },
-          crewId: { type: "string", description: "選配：指定查其他 agent（如 coding.em）；search 未指定時搜全部" },
+          crewId: { type: "string", description: "選配:指定查其他 agent(如 coding.em);search 未指定時搜全部" },
         },
         required: ["action"],
       },
@@ -813,7 +1023,7 @@ export const PAAW_TOOLS = [
     type: "function",
     function: {
       name: "task_update",
-      description: "Update a coding task. Actions: update (change fields), note (add note), assign (assign agent). No pipeline — use status directly (open|close|pending|ignore).",
+      description: "Update a coding task. Actions: update (change fields), note (add note), assign (assign agent). No pipeline - use status directly (open|close|pending|ignore).",
       parameters: {
         type: "object",
         properties: {
@@ -865,7 +1075,7 @@ export const PAAW_TOOLS = [
     type: "function",
     function: {
       name: "dispatch_agent",
-      description: "派工給其他 agent 執行任務。一次只派一個 agent，等結果回來再派下一個。",
+      description: "派工給其他 agent 執行任務。一次只派一個 agent,等結果回來再派下一個。",
       parameters: {
         type: "object",
         properties: {
@@ -876,11 +1086,11 @@ export const PAAW_TOOLS = [
           },
           task: {
             type: "string",
-            description: "具體任務說明（要明確：哪個檔案、哪個函數、要做什麼）",
+            description: "具體任務說明(要明確:哪個檔案、哪個函數、要做什麼)",
           },
           taskId: {
             type: "string",
-            description: "對應的 TASK-XXX ID（如果有）",
+            description: "對應的 TASK-XXX ID(如果有)",
           },
         },
         required: ["agentId", "task"],
@@ -888,34 +1098,34 @@ export const PAAW_TOOLS = [
     },
   },
 
-  // ── Auto Dispatch（task-driven，EM 自然語言確認制派工，2026-08-29）──
-  // 一律走 API（/preview、/start、/stop）— 跟 cron / panel / EM chat 同一條路
+  // ── Auto Dispatch(task-driven,EM 自然語言確認制派工,2026-08-29)──
+  // 一律走 API(/preview、/start、/stop)- 跟 cron / panel / EM chat 同一條路
   {
     type: "function",
     function: {
       name: "auto_dispatch",
-      description: "自動派工（task-driven）：掃 TASKS.json 的 open task，背景逐一派給 agent 執行（每個 task 獨立 context，可長時間跑完，最後統整報告）。流程：action=preview 先看範圍（不執行）→ 向使用者展示待確認 → 使用者確認後 action=start 開始 → 要停就 action=stop（安全中斷點）。大範圍派工優先用這個，不要逐個 dispatch_agent。",
+      description: "自動派工(task-driven):掃 TASKS.json 的 open task,背景逐一派給 agent 執行(每個 task 獨立 context,可長時間跑完,最後統整報告)。流程:action=preview 先看範圍(不執行)→ 向使用者展示待確認 → 使用者確認後 action=start 開始 → 要停就 action=stop(安全中斷點)。大範圍派工優先用這個,不要逐個 dispatch_agent。",
       parameters: {
         type: "object",
         properties: {
-          action: { type: "string", enum: ["preview", "start", "stop"], description: "preview=看派工範圍（不執行）；start=背景開始執行；stop=中斷（目前 task 完成後停止）" },
-          cwd: { type: "string", description: "專案 root 絕對路徑（帶 system prompt 裡 Current Project Root 的值）" },
+          action: { type: "string", enum: ["preview", "start", "stop"], description: "preview=看派工範圍(不執行);start=背景開始執行;stop=中斷(目前 task 完成後停止)" },
+          cwd: { type: "string", description: "專案 root 絕對路徑(帶 system prompt 裡 Current Project Root 的值)" },
         },
         required: ["action"],
       },
     },
   },
 
-  // ── Release Unit Tools（Tool 化三防線：context / impact / verify）──
+  // ── Release Unit Tools(Tool 化三防線:context / impact / verify)──
   {
     type: "function",
     function: {
       name: "ru_context",
-      description: "Release Unit context — 讀專案技術桡 + .paaw 三大文件（PROJECT/ARCHITECTURE/DECISIONS）。改碼前必讀。",
+      description: "Release Unit context - 讀專案技術桡 + .paaw 三大文件(PROJECT/ARCHITECTURE/DECISIONS)。改碼前必讀。",
       parameters: {
         type: "object",
         properties: {
-          withDocs: { type: "boolean", description: "是否帶入文件全文（預設只回清單+規範）" },
+          withDocs: { type: "boolean", description: "是否帶入文件全文(預設只回清單+規範)" },
         },
       },
     },
@@ -924,11 +1134,11 @@ export const PAAW_TOOLS = [
     type: "function",
     function: {
       name: "ru_dependencies",
-      description: "查檔案依賴：我 import 誰（forward）、誰 import 我（reverse）、用了哪些外部套件。",
+      description: "查檔案依賴:我 import 誰(forward)、誰 import 我(reverse)、用了哪些外部套件。",
       parameters: {
         type: "object",
         properties: {
-          file: { type: "string", description: "檔案路徑（相對/絕對/檔名皆可）" },
+          file: { type: "string", description: "檔案路徑(相對/絕對/檔名皆可)" },
         },
         required: ["file"],
       },
@@ -938,12 +1148,12 @@ export const PAAW_TOOLS = [
     type: "function",
     function: {
       name: "ru_impact_analysis",
-      description: "改動影響分析（改前必跑）：給定檔案清單，回傳直接/間接受影響的檔案（含深度）與樞紐熱點。",
+      description: "改動影響分析(改前必跑):給定檔案清單,回傳直接/間接受影響的檔案(含深度)與樞紐熱點。",
       parameters: {
         type: "object",
         properties: {
           files: { type: "array", items: { type: "string" }, description: "預計改動的檔案清單" },
-          changeType: { type: "string", enum: ["modify", "add", "delete"], description: "改動類型（預設 modify）" },
+          changeType: { type: "string", enum: ["modify", "add", "delete"], description: "改動類型(預設 modify)" },
         },
         required: ["files"],
       },
@@ -953,19 +1163,66 @@ export const PAAW_TOOLS = [
     type: "function",
     function: {
       name: "ru_verify",
-      description: "驗證（改完必跑）：執行 build/lint/type-check/test，回傳每關結果與失敗輸出。",
+      description: "驗證(改完必跑):執行 build/lint/type-check/test,回傳每關結果與失敗輸出。",
       parameters: {
         type: "object",
         properties: {
-          checks: { type: "array", items: { type: "string", enum: ["build", "lint", "type-check", "test"] }, description: "指定關卡（預設全部）" },
+          checks: { type: "array", items: { type: "string", enum: ["build", "lint", "type-check", "test"] }, description: "指定關卡(預設全部)" },
         },
       },
     },
   },
 
+  // ── Release Prep(2026-09-18 Fleming:跟 EM 說「準備 release」→ 自動派工補齊證據)──
+  {
+    type: "function",
+    function: {
+      name: "release_prep_status",
+      description: "Release 準備盤點:git 乾淨度、open tasks、七項證據現況(測試/QA/掃描/verify/handover)一次看。準備 release 的第一步。",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "test_run",
+      description: "跑全套測試(unit + e2e),結果落檔 .paaw(Release Request tests 項證據)。",
+      parameters: {
+        type: "object",
+        properties: {
+          includeE2e: { type: "boolean", description: "含 e2e(預設 true)" },
+        },
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "security_scan",
+      description: "semgrep 安全掃描,結果落檔 .paaw/security/scan-results.json(Release Request security 項證據)。",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "ru_model_refresh",
+      description: "重建 release-unit model(feature map - features/apis 結構)。Release Request scope 的 features/apis 統計靠它,release 準備時先刷新再跑證據。",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "handover_refresh",
+      description: "刷新 handover state(.paaw/handover-state.json 對齊當下 HEAD - Release Request handover 項證據)。",
+      parameters: { type: "object", properties: {} },
+    },
+  },
+
   ];
 
-// ── Tool Group System — load only what each agent needs ──
+// ── Tool Group System - load only what each agent needs ──
 
 // Tool name → group mapping
 const TOOL_GROUP_MAP = {
@@ -975,6 +1232,11 @@ const TOOL_GROUP_MAP = {
   reference_read: "core",
   git: "core", bash: "core", ask_user: "core",
 
+  // Dev Server Controller(2026-09-10)- core:developer/tester 可用;core-read 只給 dev_log(唯讀)
+  dev_server: "core", dev_log: "core",
+  // 2026-09-12:API Tester tool - developer/tester 都在 core group,可直接打 API 並存入 UI 共用歷史
+  api_test: "core",
+
   // Browser testing
   browser_test: "browser",
   browser_navigate: "browser",
@@ -982,25 +1244,35 @@ const TOOL_GROUP_MAP = {
   browser_screenshot: "browser",
   browser_click: "browser",
   browser_type: "browser",
+  browser_select: "browser",
 
   // Memory & logging
   action_log_add: "memory", action_log_list: "memory",
   agent_memory_save: "memory", agent_memory_load: "memory",
-  conversation_history: "memory", // 2026-09-06：聊天記錄查詢（memory group → 全 crew 可用）
+  conversation_history: "memory", // 2026-09-06:聊天記錄查詢(memory group → 全 crew 可用)
 
   // Decision & changelog
   record_decision: "decisions", docs: "decisions",
 
+  // QA Results - QA 記錄共享存儲(2026-09-17 Fleming:qa agent 留記錄、其他 agent 讀寫)
+  qa_record_save: "qa-records", qa_record_list: "qa-records", qa_record_update: "qa-records",
+
+  // Release Requests - v3(2026-09-18):RM agent 讀 RR 證據、寫建議 verdict(人確認)
+  rr_list: "release-requests", rr_get: "release-requests", rr_suggest: "release-requests", rr_create: "release-requests",
+
+  // Release Prep - v4(2026-09-18):EM「準備 release」自動補證據(受控工具,不開 bash)
+  release_prep_status: "release-prep", test_run: "release-prep", security_scan: "release-prep", handover_refresh: "release-prep", ru_model_refresh: "release-prep",
+
   // Staged summary (agents record why they staged files)
   staged_summary: "core",
 
-  // Project Info — unified tool (replaces 14 separate project_* read tools)
+  // Project Info - unified tool (replaces 14 separate project_* read tools)
   project_info: "project",
 
-  // Project edit — unified mutation tool
+  // Project edit - unified mutation tool
   project_edit: "project-edit",
 
-  // Project Board — 維護 data/projects/ 專案看板（RU 對應 project）
+  // Project Board - 維護 data/projects/ 專案看板(RU 對應 project)
   project_board: "project-board",
 
   // Notes
@@ -1011,30 +1283,36 @@ const TOOL_GROUP_MAP = {
 
   // Docs & CU
   cu_refresh: "docs",
+
+  // Release Unit tools - 2026-09-18 修復:這四個一直沒掛進 TOOL_GROUP_MAP,
+  // release-unit group 是空的 → ru_verify 對所有 agent 都不可見(含 fallback 列了它的 em/developer/qa)
+  ru_context: "release-unit", ru_dependencies: "release-unit", ru_impact_analysis: "release-unit", ru_verify: "release-unit",
 };
 
 // ── core-read: read-only subset of core (no bash/write/edit/git) ──
 // For non-coding agents: architect, QA, helpdesk, EM
-const CORE_READ_TOOLS = new Set(["read_file", "reference_read", "glob", "grep", "diff", "ask_user"]);
+const CORE_READ_TOOLS = new Set(["read_file", "reference_read", "glob", "grep", "diff", "ask_user", "dev_log"]);
 
 // ── Fallback groups (used when crew.json has no toolGroups) ──
 const AGENT_FALLBACK_GROUPS = {
-  // Architect: read-only + decisions + project + project-board（維護 RU project）+ tasks（security 修復開 task — 2026-09-06）
-  architect: ["core-read", "memory", "decisions", "project", "project-edit", "project-board", "tasks", "release-unit"],
+  // Architect: read-only + decisions + project + project-board(維護 RU project)+ tasks(security 修復開 task - 2026-09-06)
+  architect: ["core-read", "memory", "decisions", "project", "project-edit", "project-board", "tasks", "release-unit", "qa-records"],
   // Developer: full core + memory + project + tasks
-  developer: ["core", "memory", "decisions", "project", "project-edit", "tasks", "release-unit"],
+  developer: ["core", "memory", "decisions", "project", "project-edit", "tasks", "release-unit", "qa-records"],
   // Tester: full core + project
-  tester: ["core", "memory", "decisions", "project", "project-edit", "release-unit"],
+  tester: ["core", "memory", "decisions", "project", "project-edit", "release-unit", "qa-records"],
   // Doc-writer: full core + project-edit + docs
-  "doc-writer": ["core", "memory", "decisions", "project", "project-edit", "docs"],
-  // CU feature 長肉 agent（feature-map v2.1）：純唯讀分析 — read_file/glob/grep/diff，無寫檔無 shell
+  "doc-writer": ["core", "memory", "decisions", "project", "project-edit", "docs", "qa-records"],
+  // CU feature 長肉 agent(feature-map v2.1):純唯讀分析 - read_file/glob/grep/diff,無寫檔無 shell
   "cu-feature": ["core-read"],
-  // QA: read-only + project + project-edit + tasks（security findings 開修復 task — 2026-09-06）
-  qa: ["core-read", "memory", "project", "project-edit", "tasks", "release-unit"],
+  // QA: read-only + project + project-edit + tasks(security findings 開修復 task - 2026-09-06)
+  qa: ["core-read", "memory", "project", "project-edit", "tasks", "release-unit", "qa-records"],
   // Helpdesk: read-only + project
-  helpdesk: ["core-read", "memory", "decisions", "project", "project-edit"],
+  helpdesk: ["core-read", "memory", "decisions", "project", "project-edit", "qa-records"],
+  // RM(fallback):v3(2026-09-18)+ release-requests(審 RR 證據、寫建議 verdict)
+  rm: ["core-read", "memory", "decisions", "project", "docs", "release-requests", "release-prep"],
   // EM: read-only + project + project-edit + docs + tasks + dispatch (no notes/browser)
-  em: ["core-read", "memory", "decisions", "project", "project-edit", "project-board", "docs", "tasks", "dispatch", "release-unit"],
+  em: ["core-read", "memory", "decisions", "project", "project-edit", "project-board", "docs", "tasks", "dispatch", "release-unit", "qa-records", "release-requests", "release-prep"],
 };
 
 // ── Cache for crew toolGroups loaded from JSON ──
@@ -1047,8 +1325,8 @@ const _crewGroupCache = new Map();
  * @returns {string[]} tool group names
  */
 function getAgentGroupsFromConfig(agentId, cwd = null) {
-  // 2026-09-06：支援 project-level toolGroups（.paaw/agents/{crewId}.json）優先於 global
-  // cache key = agentId::cwd（project 覆寫 per-RU）
+  // 2026-09-06:支援 project-level toolGroups(.paaw/agents/{crewId}.json)優先於 global
+  // cache key = agentId::cwd(project 覆寫 per-RU)
   const cacheKey = `${agentId}::${cwd || ""}`;
   // Check cache first
   if (_crewGroupCache.has(cacheKey)) return _crewGroupCache.get(cacheKey);
@@ -1062,14 +1340,14 @@ function getAgentGroupsFromConfig(agentId, cwd = null) {
     qa: "coding.qa",
     helpdesk: "coding.helpdesk",
     em: "coding.em",
-    rm: "coding.rm",          // 2026-09-06：補齊 10 crew 映射（原本缺 → fallback core+memory 全開）
+    rm: "coding.rm",          // 2026-09-06:補齊 10 crew 映射(原本缺 → fallback core+memory 全開)
     ops: "coding.ops",
     handover: "coding.handover",
   };
   const crewId = crewMap[agentId];
   if (!crewId) return AGENT_FALLBACK_GROUPS[agentId] || ["core", "memory"];
 
-  // ── Project-level override（.paaw/agents/{crewId}.json 的 toolGroups 優先）──
+  // ── Project-level override(.paaw/agents/{crewId}.json 的 toolGroups 優先)──
   if (cwd) {
     try {
       const projPath = join(cwd, ".paaw", "agents", `${crewId}.json`);
@@ -1135,7 +1413,7 @@ export function getToolsForAgent(agentId, extraGroups = [], cwd = null) {
     }
 
     const group = TOOL_GROUP_MAP[name];
-    // 🌐 內建瀏覽器工具：所有 agent 一律可用（Fleming 2026-08-27 定調 — 讀網頁/操作/截圖是通用能力）
+    // 🌐 內建瀏覽器工具:所有 agent 一律可用(Fleming 2026-08-27 定調 - 讀網頁/操作/截圖是通用能力)
     if (group === "browser") return true;
     return group && groups.has(group);
   });
@@ -1227,7 +1505,7 @@ function _parseTestResult(output) {
 
   // Generic: check for common failure patterns
   if (out.includes("fail") || out.includes("error") || out.includes("✗") || out.includes("✘")) {
-    // Might be a real failure or just noise — be conservative
+    // Might be a real failure or just noise - be conservative
     if (out.includes("failed") || out.includes("test suite failed")) {
       return { ok: false, failed: 1, total: 1 };
     }
@@ -1239,7 +1517,7 @@ function _parseTestResult(output) {
     return { ok: true, failed: 0, total: parseInt(totalMatch?.[1] || "1") };
   }
 
-  // No recognizable pattern — assume pass if exit code was ok (we already ran it successfully)
+  // No recognizable pattern - assume pass if exit code was ok (we already ran it successfully)
   return { ok: true, failed: 0, total: 0 };
 }
 
@@ -1334,10 +1612,10 @@ async function _nativeGrep(searchPath, pattern, include, maxResults = 50, ignore
 
 async function runShell(command, cwd, timeoutMs = 30_000) {
   try {
-    // Runtime log 中央目錄注入（2026-09-06）：agents 在 RU 目錄跑，但要能寫 log/<sub>/<ru>/
-    // - $PAAW_LOG_HOME           → log/ 根（generic）
-    // - $PAAW_TMP                → log/tmp/<ru-slug>/（agent scratch，session 自動清）
-    // - $PAAW_APP_CONSOLE_DIR    → log/app-console/<ru-slug>/（developer 啟動 app 的 nohup 輸出）
+    // Runtime log 中央目錄注入(2026-09-06):agents 在 RU 目錄跑,但要能寫 log/<sub>/<ru>/
+    // - $PAAW_LOG_HOME           → log/ 根(generic)
+    // - $PAAW_TMP                → log/tmp/<ru-slug>/(agent scratch,session 自動清)
+    // - $PAAW_APP_CONSOLE_DIR    → log/app-console/<ru-slug>/(developer 啟動 app 的 nohup 輸出)
     const _ruSlug = logSlug(cwd);
     const { stdout, stderr } = await shellExec(command, {
       cwd,
@@ -1373,8 +1651,8 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
   if (agentId && ["action_log_add", "action_log_list", "agent_memory_save", "agent_memory_load"].includes(name)) {
     args._agentId = agentId;
   }
-  // 2026-09-07：EM 派工/任務工具必須落在「呼叫者的專案」（coding app import 的 release unit path），
-  // 不是 PAAW workspaces[0] — 否則跨專案派工時 QA cwd / task / action log 全落在錯的專案
+  // 2026-09-07:EM 派工/任務工具必須落在「呼叫者的專案」(coding app import 的 release unit path),
+  // 不是 PAAW workspaces[0] - 否則跨專案派工時 QA cwd / task / action log 全落在錯的專案
   if (["dispatch_agent", "task_create", "task_update", "task_list"].includes(name)) {
     args._callerPath = cwd;
   }
@@ -1455,15 +1733,15 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
     return startsWith(abs, normCwd) || startsWith(abs, normRoot) || workspaceDirs.some((d) => startsWith(abs, norm(d))) || inPaawKnowledge;
   };
 
-  // ── Feature Boundary helpers (must be BEFORE switch — const in switch causes TDZ) ──
+  // ── Feature Boundary helpers (must be BEFORE switch - const in switch causes TDZ) ──
   const _checkBoundary = (filePath) => {
     if (!featureBoundary || !featureBoundary.allowedFiles) return null; // no boundary active
     const rel = filePath.replace(/\\/g, "/").replace(cwd.replace(/\\/g, "/").replace(/\/+$/, "") + "/", "");
-    // New file — always allow
+    // New file - always allow
     if (!existsSync(filePath)) return null;
     // File is in allowed scope
     if (featureBoundary.allowedFiles.some(f => f.replace(/\\/g, "/") === rel)) return null;
-    // File is outside boundary — return violation
+    // File is outside boundary - return violation
     return rel;
   };
   const _recordViolation = (file, tool) => {
@@ -1484,7 +1762,7 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
 
       // ── Reference Read Tool (workspace/ and knowledge/) ──
       case "reference_read": {
-        // Always use PAAW_ROOT for knowledge/workspace — not cwd/rootDir
+        // Always use PAAW_ROOT for knowledge/workspace - not cwd/rootDir
         // because these directories live in the PAAW installation, not the project
         const paawRoot = _PAAW_ROOT;
         let refBase;
@@ -1540,8 +1818,9 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
           try {
             const content = await readFile(filePath, "utf-8");
             const maxLen = 100_000;
+            // 2026-09-14: cutSafeStart 不切 surrogate pair(emoji 切半 → 孤兒 \ud83d → LLM 500)
             const result = content.length > maxLen
-              ? content.slice(0, maxLen) + `\n... (truncated, ${content.length} bytes total)`
+              ? cutSafeStart(content, maxLen) + `\n... (truncated, ${content.length} bytes total)`
               : content;
             if (onEvent) onEvent({ type: "tool_end", name, result: `${args.source}/${args.path} (${content.length} bytes)` });
             return result;
@@ -1594,7 +1873,7 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
 
       case "read_file": {
         const filePath = resolvePath(args.path);
-        if (!isPathAllowed(args.path)) return `Error: path '${args.path}' resolves to '${filePath}' which is outside all allowed roots. cwd='${cwd}'. Allowed roots: project dir (cwd), PAAW root${workspaceDirs.length ? ", workspaces: " + workspaceDirs.join(", ") : " (no extra workspaces mounted)"}, knowledge. Note: relative vs absolute doesn't matter — the resolved path must be INSIDE an allowed root. If you need a sibling directory, ask the user to add it to data/workspaces.json.`;
+        if (!isPathAllowed(args.path)) return `Error: path '${args.path}' resolves to '${filePath}' which is outside all allowed roots. cwd='${cwd}'. Allowed roots: project dir (cwd), PAAW root${workspaceDirs.length ? ", workspaces: " + workspaceDirs.join(", ") : " (no extra workspaces mounted)"}, knowledge. Note: relative vs absolute doesn't matter - the resolved path must be INSIDE an allowed root. If you need a sibling directory, ask the user to add it to data/workspaces.json.`;
         if (!existsSync(filePath)) return `Error: file not found: ${args.path}`;
         const content = await readFile(filePath, "utf-8");
         // Line-based reading with offset/limit
@@ -1609,8 +1888,9 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
         }
         // Truncate very large files
         const maxLen = 100_000;
+        // 2026-09-14: cutSafeStart 不切 surrogate pair(emoji 切半 → 孤兒 \ud83d → LLM 500)
         const result = content.length > maxLen
-          ? content.slice(0, maxLen) + `\n... (truncated, ${content.length} bytes total)`
+          ? cutSafeStart(content, maxLen) + `\n... (truncated, ${content.length} bytes total)`
           : content;
         if (onEvent) onEvent({ type: "tool_end", name, result: `Read ${filePath} (${content.length} bytes)` });
         return result;
@@ -1676,7 +1956,7 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
           const content = await readFile(filePath, "utf-8");
           const occurrences = content.split(args.old_text).length - 1;
           if (occurrences === 0) return `Error: old_text not found in ${args.path}`;
-          if (occurrences > 1) return `Error: old_text found ${occurrences} times in ${args.path} — must be unique`;
+          if (occurrences > 1) return `Error: old_text found ${occurrences} times in ${args.path} - must be unique`;
           const newContent = content.replace(args.old_text, args.new_text);
           await writeFile(filePath, newContent, "utf-8");
           if (onEvent) onEvent({ type: "tool_end", name, result: `Edited ${filePath}` });
@@ -1698,29 +1978,19 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
         if (!isPathAllowed(args.path || ".")) return `Error: path '${args.path}' resolves outside all allowed roots (cwd='${cwd}'${workspaceDirs.length ? ", workspaces: " + workspaceDirs.join(", ") : ""}). Ask user to add the directory to data/workspaces.json if needed.`;
         const pattern = args.pattern;
         let result;
-        if (IS_WIN) {
-          // Windows: use Node.js native FIRST (fast, no shell overhead, no path issues)
-          result = await _nativeGlob(basePath, pattern, 100, cwd);
-          // Only try rg if native returns nothing and rg might be installed
-          if (result === "(no files found)" || result.length < 10) {
-            const cmd = `rg --files --glob "${pattern}" --max-depth 15 "${basePath}"`;
-            const rgResult = await runShell(cmd, cwd, 8_000);
-            if (!rgResult.includes("not recognized") && !rgResult.includes("command not found") && !rgResult.includes("(no output)") && rgResult.length > result.length) {
-              // Convert rg absolute paths to relative, forward-slash paths
-              const normCwd = cwd.replace(/\\/g, "/");
-              result = rgResult.split("\n").filter(l => l.trim()).map(l => {
-                const norm = l.replace(/\\/g, "/");
-                return norm.startsWith(normCwd + "/") ? norm.slice(normCwd.length + 1) : l;
-              }).join("\n");
-            }
-          }
-        } else {
-          // Unix: use rg with glob, fallback to find
-          const cmd = `rg --files --glob '${pattern}' --max-depth 15 '${basePath}'`;
-          result = await runShell(cmd, cwd, 8_000);
-          if (result.includes("command not found")) {
-            const findCmd = `find '${basePath}' -name '${pattern}' -not -path '*/node_modules/*' -not -path '*/.git/*' -type f | head -100`;
-            result = await runShell(findCmd, cwd, 8_000);
+        // 跨平台 native-first(2026-09-12:公司 Linux 沒裝 rg → agent 拿到 command not found。
+        //   純 Node.js 遞迴,不依賴 rg/find/grep;rg 只在「有裝」時當加強 - command -v 靜默探測,agent 永遠不會看到 command not found)
+        result = await _nativeGlob(basePath, pattern, 100, cwd);
+        if (result === "(no files found)" || result.length < 10) {
+          const cmd = `command -v rg >/dev/null 2>&1 && rg --files --glob "${pattern}" --max-depth 15 "${basePath}"`;
+          const rgResult = await runShell(cmd, cwd, 8_000);
+          if (!rgResult.includes("not recognized") && !rgResult.includes("command not found") && !rgResult.includes("(no output)") && rgResult.length > result.length) {
+            // Convert rg absolute paths to relative, forward-slash paths
+            const normCwd = cwd.replace(/\\/g, "/");
+            result = rgResult.split("\n").filter(l => l.trim()).map(l => {
+              const norm = l.replace(/\\/g, "/");
+              return norm.startsWith(normCwd + "/") ? norm.slice(normCwd.length + 1) : l;
+            }).join("\n");
           }
         }
         // Smart truncate (head+tail, preserves errors at end)
@@ -1736,40 +2006,25 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
         const maxResults = args.max_results || 50;
         const caseFlag = args.case_sensitive ? "" : "-i";
         let result;
-        if (IS_WIN) {
-          // Windows: use Node.js native FIRST (fast, no shell overhead, no path issues)
-          result = await _nativeGrep(searchPath, args.pattern, args.include, maxResults, !args.case_sensitive, cwd);
-          // Only try rg if native returns nothing and rg might be installed
-          if (result === "(no matches)" || result.length < 10) {
-            const includeFlag = args.include ? `--glob "${args.include}"` : "";
-            const cmd = `rg ${caseFlag} ${includeFlag} --max-count ${maxResults} --line-number --no-heading "${args.pattern}" "${searchPath}"`;
-            const rgResult = await runShell(cmd, cwd, 10_000);
-            if (!rgResult.includes("not recognized") && !rgResult.includes("command not found") && !rgResult.includes("(no output)") && rgResult.length > result.length) {
-              // Convert rg absolute paths to relative, forward-slash paths
-              const normCwd = cwd.replace(/\\/g, "/");
-              result = rgResult.split("\n").filter(l => l.trim()).map(l => {
-                const colonIdx = l.indexOf(":");
-                if (colonIdx > 0) {
-                  const norm = l.slice(0, colonIdx).replace(/\\/g, "/");
-                  const rel = norm.startsWith(normCwd + "/") ? norm.slice(normCwd.length + 1) : l.slice(0, colonIdx);
-                  return rel + l.slice(colonIdx);
-                }
-                return l;
-              }).join("\n");
-            }
-          }
-        } else {
-          // Unix: rg with fallback to grep
+        // 跨平台 native-first(2026-09-12 同 glob:不依賴 rg/grep;rg 有裝才加強,靜默探測)
+        result = await _nativeGrep(searchPath, args.pattern, args.include, maxResults, !args.case_sensitive, cwd);
+        if (result === "(no matches)" || result.length < 10) {
           const includeFlag = args.include ? `--glob '${args.include}'` : "";
-          const cmd = `rg ${caseFlag} ${includeFlag} --max-count ${maxResults} --line-number --no-heading '${args.pattern}' '${searchPath}'`;
-          result = await runShell(cmd, cwd, 10_000);
-          if (result.includes("command not found")) {
-            const grepInclude = args.include ? `--include='${args.include}'` : "";
-            const grepCmd = `grep -rn ${caseFlag} ${grepInclude} --max-count=${maxResults} '${args.pattern}' '${searchPath}'`;
-            result = await runShell(grepCmd, cwd, 10_000);
+          const cmd = `command -v rg >/dev/null 2>&1 && rg ${caseFlag} ${includeFlag} --max-count ${maxResults} --line-number --no-heading '${args.pattern}' '${searchPath}'`;
+          const rgResult = await runShell(cmd, cwd, 10_000);
+          if (!rgResult.includes("not recognized") && !rgResult.includes("command not found") && !rgResult.includes("(no output)") && rgResult.length > result.length) {
+            result = rgResult.split("\n").filter(l => l.trim()).map(l => {
+              const colonIdx = l.indexOf(":");
+              if (colonIdx > 0) {
+                const norm = l.slice(0, colonIdx).replace(/\\/g, "/");
+                const rel = norm.startsWith(cwd.replace(/\\/g, "/") + "/") ? norm.slice(cwd.replace(/\\/g, "/").length + 1) : l.slice(0, colonIdx);
+                return rel + l.slice(colonIdx);
+              }
+              return l;
+            }).join("\n");
           }
         }
-        // Smart truncate (head+tail — preserves grep matches at end)
+        // Smart truncate (head+tail - preserves grep matches at end)
         const truncated = smartTruncateToolResult(result, 12_000);
         if (onEvent) onEvent({ type: "tool_end", name, result: truncated.slice(0, 300) });
         return truncated;
@@ -1796,7 +2051,7 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
           if (onEvent) onEvent({ type: "tool_end", name, result: result.slice(0, 300) });
           return result;
         }
-        // Git diff — git works on both platforms
+        // Git diff - git works on both platforms
         const diffPath = args.path ? resolvePath(args.path) : cwd;
         const against = args.against || "HEAD";
         if (IS_WIN) {
@@ -1829,17 +2084,46 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
       // ══════════════════════════════════════════
 
       case "bash": {
+        // 🚧 鐵律(Fleming 2026-09-13):process 控制只限本 RU dev server(用 dev_server 工具),
+        // 外面的一律不可碰 -- 尤其 PAAW coding app 本身。硬防護見 lib/shell-guard.mjs
+        const { guardShellProcessScope } = await import("./shell-guard.mjs");
+        const guard = await guardShellProcessScope(args.command, cwd);
+        if (guard.blocked) {
+          if (onEvent) onEvent({ type: "tool_end", name, result: guard.message.slice(0, 500) });
+          return guard.message;
+        }
         const timeoutSec = Math.min(args.timeout || 120, _agentCfg.bashTimeoutSeconds || 300);
         const timeoutMs = timeoutSec * 1000;
         const result = await runShell(args.command, cwd, timeoutMs);
-        // Smart truncate (head+tail — preserves build errors/test results at end)
+        // Smart truncate (head+tail - preserves build errors/test results at end)
         const truncated = smartTruncateToolResult(result, 12_000, { alwaysKeepTail: true });
         if (onEvent) onEvent({ type: "tool_end", name, result: truncated.slice(0, 500) });
         return truncated;
       }
 
       // ══════════════════════════════════════════
-      // ── Release Unit Tools（三防線：context / impact / verify）──
+      // ── Dev Server Controller(2026-09-10 Phase 1)──
+      // 長駐程序管理:start/stop/restart/status + log 讀取(lib/dev-server.mjs)
+      // ══════════════════════════════════════════
+
+      case "dev_server": {
+        const { devServerAction } = await import("./dev-server.mjs");
+        const out = await devServerAction(cwd, args);
+        if (onEvent) onEvent({ type: "tool_end", name, result: out.slice(0, 500) });
+        return out;
+      }
+
+      case "dev_log": {
+        const { readDevLog } = await import("./dev-server.mjs");
+        const out = await readDevLog(cwd, args);
+        // log tail 可能很長 - smart truncate 保尾(error 通常在尾端)
+        const truncated = smartTruncateToolResult(out, 10_000, { alwaysKeepTail: true });
+        if (onEvent) onEvent({ type: "tool_end", name, result: `tail ${args.lines || 100} lines` });
+        return truncated;
+      }
+
+      // ══════════════════════════════════════════
+      // ── Release Unit Tools(三防線:context / impact / verify)──
       // ══════════════════════════════════════════
 
       case "ru_context": {
@@ -1850,12 +2134,23 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
           if (!existsSync(f)) return null;
           try { return readSync(f, "utf-8"); } catch { return null; }
         };
-        const docs = ["PROJECT.md", "ARCHITECTURE.md", "DECISIONS.md", "CONTEXT.md"];
+        // 2026-09-20 Fleming：不想維護 PROJECT.md — 專案知識主軸 = Feature Map；
+        // PROJECT.md 不列（內容透過 project_info(context) 給，含 CU 自動初稿），只列其餘人寫文件
+        const docs = ["ARCHITECTURE.md", "DECISIONS.md", "CONTEXT.md"];
         const found = [];
         for (const d of docs) {
           if (await readDoc(d)) found.push(d);
         }
-        let out = `【Release Unit context】${cwd.split(/[\\/]/).pop()}\n技術桡：${tech.language} / ${tech.packageManager} / ${(tech.frameworks || []).join(", ") || "-"}\n.paaw 文件：${found.length ? found.join(", ") : "（尚未初始化）"}\n`;
+        let out = `【Release Unit context】${cwd.split(/[\\/]/).pop()}\n技術桡：${tech.language} / ${tech.packageManager} / ${(tech.frameworks || []).join(", ") || "-"}\n人寫文件：${found.length ? found.join(", ") : "無"}\n`;
+        // Feature Map 可用性提示 - CU 做完 agent 就該用它定位功能,不要從 raw code 開始讀
+        try {
+          const fmPath = resolve(cwd, ".paaw", "features", "FEATURES.json");
+          if (existsSync(fmPath)) {
+            const fm = JSON.parse(readSync(fmPath, "utf-8"));
+            const n = (fm.features || []).length;
+            if (n > 0) out += `Feature Map:✅ 已建立(${n} features)- 用 project_info(category=context) 取得專案全貌(feature → files + file → feature),定位功能從這裡開始\n`;
+          }
+        } catch {}
         if (args.withDocs) {
           for (const d of ["PROJECT.md", "ARCHITECTURE.md", "DECISIONS.md"]) {
             const c = await readDoc(d);
@@ -1870,33 +2165,163 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
         const { buildDependencyGraph, queryGraph } = await import("./release-unit/dependencies.mjs");
         const graph = await buildDependencyGraph(cwd);
         const r = queryGraph(graph, args.file, "both");
-        if (!r.found) return `檔案不在依賴圖中：${args.file}（掃描 ${graph.fileCount} 檔，adapter=${graph.adapter}）。可用相對路徑或檔名重試。`;
+        if (!r.found) return `檔案不在依賴圖中:${args.file}(掃描 ${graph.fileCount} 檔,adapter=${graph.adapter})。可用相對路徑或檔名重試。`;
         const fmt = (list, label) => list?.length ? `\n【${label}】(${list.length})\n` + list.map(f => `  ${f}`).join("\n") : `\n【${label}】(0)`;
         if (onEvent) onEvent({ type: "tool_end", name, result: `${r.file}: fwd ${r.forward?.length || 0} / rev ${r.reverse?.length || 0}` });
-        return `檔案：${r.file}${fmt(r.forward, "我 import 誰")}${fmt(r.reverse, "誰 import 我")}${fmt(r.externals, "外部套件")}`;
+        return `檔案:${r.file}${fmt(r.forward, "我 import 誰")}${fmt(r.reverse, "誰 import 我")}${fmt(r.externals, "外部套件")}`;
       }
 
       case "ru_impact_analysis": {
         const { impactAnalysis } = await import("./release-unit/impact.mjs");
         const r = await impactAnalysis(cwd, args.files, { changeType: args.changeType });
         if (r.unresolved.length) {
-          return `這些檔案不在依賴圖中，無法分析：${r.unresolved.join(", ")}。請確認路徑（相對於專案根）。`;
+          return `這些檔案不在依賴圖中,無法分析:${r.unresolved.join(", ")}。請確認路徑(相對於專案根)。`;
         }
         const lines = r.affected.map(a => `  d${a.depth} ${a.file}`);
         if (onEvent) onEvent({ type: "tool_end", name, result: `affected ${r.affectedCount}` });
-        return `【影響分析】改動 ${r.changed.length} 檔（${r.changeType}）→ 受影響 ${r.affectedCount} 檔\n` +
-          (lines.length ? lines.join("\n") : "（無內部依賴者 — 安全）") +
-          (r.hotspots.length ? `\n【樞紐熱點（改動需特別小心）】\n` + r.hotspots.slice(0, 5).map(h => `  ${h.file}（${h.dependents} 依賴者）`).join("\n") : "");
+        return `【影響分析】改動 ${r.changed.length} 檔(${r.changeType})→ 受影響 ${r.affectedCount} 檔\n` +
+          (lines.length ? lines.join("\n") : "(無內部依賴者 - 安全)") +
+          (r.hotspots.length ? `\n【樞紐熱點(改動需特別小心)】\n` + r.hotspots.slice(0, 5).map(h => `  ${h.file}(${h.dependents} 依賴者)`).join("\n") : "");
       }
 
       case "ru_verify": {
         const { runVerify } = await import("./release-unit/verify.mjs");
-        if (onEvent) onEvent({ type: "tool_end", name, result: "verify running…" });
+        if (onEvent) onEvent({ type: "tool_end", name, result: "verify running..." });
         const report = await runVerify(cwd, { checks: args.checks });
         const lines = report.checks.map(c =>
-          `${c.ok ? "✅" : "❌"} ${c.check}（${Math.round(c.durationMs / 100) / 10}s）${c.ok ? "" : "\n" + (c.output || "").slice(-1500)}`);
+          `${c.ok ? "✅" : "❌"} ${c.check}(${Math.round(c.durationMs / 100) / 10}s)${c.ok ? "" : "\n" + (c.output || "").slice(-1500)}`);
         if (onEvent) onEvent({ type: "tool_end", name, result: `verify ${report.overall}` });
-        return `【驗證結果】${report.overall.toUpperCase()}（${report.ran.join(", ") || "無可執行關卡"}）\n${lines.join("\n")}`;
+        return `【驗證結果】${report.overall.toUpperCase()}(${report.ran.join(", ") || "無可執行關卡"})\n${lines.join("\n")}`;
+      }
+
+      // ── Release Prep tools(2026-09-18)──
+      case "release_prep_status": {
+        const { execSync } = await import("child_process");
+        const { existsSync, readFileSync, statSync } = await import("fs");
+        const { join } = await import("path");
+        const git = (c) => { try { return execSync(`git ${c}`, { cwd, encoding: "utf-8", timeout: 15000 }).trim(); } catch { return ""; } };
+        const dirty = git("status --porcelain").split("\n").filter(Boolean);
+        const unpushed = git("log @{u}..HEAD --oneline").split("\n").filter(Boolean);
+        // open tasks
+        let openTasks = [];
+        try {
+          const tp = join(cwd, ".paaw", "tasks", "TASKS.json");
+          if (existsSync(tp)) {
+            const all = JSON.parse(readFileSync(tp, "utf-8")).tasks || [];
+            openTasks = all.filter(t => !["close", "released"].includes(t.status)).map(t => `${t.id}(${t.status})${t.title ? " " + t.title.slice(0, 40) : ""}`);
+          }
+        } catch {}
+        // 證據快照
+        const ev = [];
+        const evPush = (label, ok, note) => ev.push(`${ok ? "✅" : "⚠️"} ${label}:${note}`);
+        try {
+          const { readLastTestRun } = await import("./test-runner.mjs");
+          const t = readLastTestRun(cwd);
+          if (t) {
+            const staleNote = t.headSha && git(`merge-base --is-ancestor ${t.headSha} HEAD`) !== "" && git(`rev-parse HEAD`) !== t.headSha ? ";落後 HEAD - 用 test_run 重跑" : "";
+            evPush("tests", t.status === "pass" && !staleNote, `${t.id} ${t.status} @ ${t.finishedAt || "?"}(${(t.summary || {}).passed ?? "?"}✓/${(t.summary || {}).failed ?? "?"}✗)${staleNote}`);
+          } else evPush("tests", false, "從未跑過 - 用 test_run 補");
+        } catch { evPush("tests", false, "讀取失敗"); }
+        try {
+          const sp = join(cwd, ".paaw", "security", "scan-results.json");
+          if (existsSync(sp)) {
+            const s = JSON.parse(readFileSync(sp, "utf-8"));
+            const sev = (s.stats || {}).bySeverity || {};
+            const when = s.scannedAt || new Date(statSync(sp).mtime).toISOString();
+            const staleRaw = git(`rev-list --count HEAD --since="${(when || "").slice(0, 19).replace("T", " ")} +0000"`);
+            const stale = parseInt(staleRaw || "0", 10) > 0
+              ? String(git(`log --since="${(when || "").slice(0, 19).replace("T", " ")} +0000" --name-only --pretty=format:%H`) || "")
+                  .split("\n").some((l) => { const t = l.trim(); return t && !/^[0-9a-f]{40}$/.test(t) && !t.startsWith(".paaw/"); }) ? staleRaw : "0"
+              : "0";
+            evPush("security", !(sev.ERROR > 0) && !(parseInt(stale || "0") > 0), `ERROR ${sev.ERROR || 0} / WARNING ${sev.WARNING || 0} @ ${when}${parseInt(stale || "0") > 0 ? `;掃描後又有 ${stale} commits` : ""}`);
+          } else evPush("security", false, "從未掃過 - 用 security_scan 補");
+        } catch { evPush("security", false, "讀取失敗"); }
+        try {
+          // CU 新鮮度(2026-09-18 Fleming 點出):RR scope 的 features/apis 統計靠
+          // release-unit-model.json(feature map)+ code-intelligence(變更情報)- 舊了 scope 失真
+          const rup = join(cwd, ".paaw", "release-unit-model.json");
+          if (existsSync(rup)) {
+            const ru = JSON.parse(readFileSync(rup, "utf-8"));
+            const when = ru.generatedAt || new Date(statSync(rup).mtime).toISOString();
+            const stale = git(`rev-list --count HEAD --since="${(when || "").slice(0, 19).replace("T", " ")} +0000"`);
+            evPush("feature map(RU model)", !(parseInt(stale || "0") > 0), `features ${ru.features?.length ?? "?"} / apis ${ru.apis?.length ?? "?"} @ ${when}${parseInt(stale || "0") > 0 ? `;落後 ${stale} commits - 用 ru_model_refresh 補` : ""}`);
+          } else evPush("feature map(RU model)", false, "尚無 - 用 ru_model_refresh 建");
+        } catch { evPush("feature map(RU model)", false, "讀取失敗"); }
+        try {
+          const vp = join(cwd, ".paaw", "verify-last.json");
+          if (existsSync(vp)) {
+            const v = JSON.parse(readFileSync(vp, "utf-8"));
+            evPush("verify", v.overall === "pass", `${v.overall} @ ${v.generatedAt || "?"}`);
+          } else evPush("verify", false, "從未驗證 - 用 ru_verify 補");
+        } catch { evPush("verify", false, "讀取失敗"); }
+        try {
+          const hp = join(cwd, ".paaw", "handover-state.json");
+          if (existsSync(hp)) {
+            const h = JSON.parse(readFileSync(hp, "utf-8"));
+            const when = h.generatedAt || new Date(statSync(hp).mtime).toISOString();
+            const stale = git(`rev-list --count HEAD --since="${(when || "").slice(0, 19).replace("T", " ")} +0000"`);
+            evPush("handover", !(parseInt(stale || "0") > 0), `@ ${when}${parseInt(stale || "0") > 0 ? `;落後 ${stale} commits - 用 handover_refresh 補` : ";新鮮"}`);
+          } else evPush("handover", false, "尚無 - 用 handover_refresh 補");
+        } catch { evPush("handover", false, "讀取失敗"); }
+        if (onEvent) onEvent({ type: "tool_end", name, result: `prep status:dirty ${dirty.length} / 證據 ${ev.length}` });
+        return `【Release 準備盤點】\n📦 git:${dirty.length ? `⚠️ ${dirty.length} 個未 commit 檔案` : "✅ 乾淨"}${unpushed.length ? `;⚠️ ${unpushed.length} 個未推 commit` : ";已推"}\n📋 open tasks(${openTasks.length}):${openTasks.length ? "\n  - " + openTasks.join("\n  - ") : "無"}\n🧪 證據:\n  ${ev.join("\n  ")}\n💡 下一步:先收未 commit 的 code(dispatch developer),全部 push 後再跑證據工具。`;
+      }
+
+      case "test_run": {
+        const { startTestRun, getRunState, readLastTestRun } = await import("./test-runner.mjs");
+        if (onEvent) onEvent({ type: "tool_end", name, result: "測試執行中(含 e2e 可能數分鐘,等完成)..." });
+        try {
+          const started = await startTestRun(cwd, { includeE2e: args.includeE2e !== false });
+          if (started.noRunner) return `【測試結果】⚠️ 未偵測到測試 runner(${JSON.stringify(started.detected || {}).slice(0, 200)})`;
+          // 同步等完成(3s 輪詢,上限 10 分鐘)- EM 派工流程需要結果才能往下走
+          const deadline = Date.now() + 600_000;
+          while (Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 3000));
+            if (!getRunState(cwd)) break;
+          }
+          const r = await readLastTestRun(cwd);
+          const s = (r && r.summary) || {};
+          if (onEvent) onEvent({ type: "tool_end", name, result: `test ${r?.status || "unknown"}` });
+          return `【測試結果】${r?.status === "pass" ? "✅" : "❌"} ${r?.id || "?"} - ${s.passed ?? "?"}✓ / ${s.failed ?? "?"}✗ @ ${r?.finishedAt || "?"}${r?.status !== "pass" ? "\n(有失敗 - dispatch developer 修完重跑)" : ""}`;
+        } catch (e) {
+          return `【測試結果】❌ 執行失敗:${e.message}`;
+        }
+      }
+
+      case "security_scan": {
+        const { runSemgrep } = await import("./semgrep-runner.mjs");
+        if (onEvent) onEvent({ type: "tool_end", name, result: "semgrep 掃描中..." });
+        try {
+          const r = await runSemgrep(cwd);
+          const sev = (r.stats || {}).bySeverity || {};
+          if (onEvent) onEvent({ type: "tool_end", name, result: `scan: E${sev.ERROR || 0}/W${sev.WARNING || 0}` });
+          return `【安全掃描】${(sev.ERROR || 0) > 0 ? "❌" : "✅"} ERROR ${sev.ERROR || 0} / WARNING ${sev.WARNING || 0} / INFO ${sev.INFO || 0}(落檔 .paaw/security/scan-results.json)${(sev.ERROR || 0) > 0 ? "\n(有 ERROR - dispatch developer 修完重掃)" : ""}`;
+        } catch (e) {
+          return `【安全掃描】❌ 執行失敗:${e.message}`;
+        }
+      }
+
+      case "ru_model_refresh": {
+        try {
+          const { buildReleaseUnitModel } = await import("./release-unit/model.mjs");
+          if (onEvent) onEvent({ type: "tool_end", name, result: "RU model 重建中(含依賴掃描)..." });
+          const m = await buildReleaseUnitModel(cwd, { persist: true });
+          if (onEvent) onEvent({ type: "tool_end", name, result: `RU model: ${m?.features?.length ?? "?"} features` });
+          return `【RU Model】✅ 已重建 - features ${m?.features?.length ?? "?"} / apis ${m?.apis?.length ?? "?"} @ ${m?.generatedAt}(.paaw/release-unit-model.json)`;
+        } catch (e) {
+          return `【RU Model】❌ 重建失敗:${e.message}`;
+        }
+      }
+
+      case "handover_refresh": {
+        try {
+          const { writeHandoverState } = await import("./release-unit/handover-state.mjs");
+          const h = await writeHandoverState(cwd);
+          if (onEvent) onEvent({ type: "tool_end", name, result: "handover refreshed" });
+          return `【Handover】✅ 已刷新 @ ${h.generatedAt}(head ${((h.currentState || {}).headSha || "").slice(0, 8)})`;
+        } catch (e) {
+          return `【Handover】❌ 刷新失敗:${e.message}`;
+        }
       }
 
       // ══════════════════════════════════════════
@@ -1966,18 +2391,198 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
         }
       }
 
+      // ═════════════════════════════════════════
+      // ── API Tester(2026-09-12)──
+      // developer agent 直接打 API:任5意 method/headers/body,
+      // 每次呼叫存入 data/api-tester-history.json(跟 UI 🌐 API Tester 同一份),
+      // 人從 UI 📜 History 看得到(帶 🤖 標記)、可點回來 replay。
+      // ═════════════════════════════════════════
+      case "api_test": {
+        // ── 2026-09-24 collection 三模式：list / run-by-name / save（Fleming：使用者可請 AI 新增 payload by collection）──
+        const _collectionsFile = () => resolve(DATA_HOME, "api-tester-collections.json");
+        const _loadCols = () => { try { return JSON.parse(readSync(_collectionsFile(), "utf-8")) || {}; } catch { return {}; } };
+        const tCollection = String(args.collection || "").trim();
+        const tPayloadName = String(args.name || "").trim();
+        const tUrl0 = String(args.url || "").trim();
+        const tMethod0 = String(args.method || "GET").toUpperCase();
+
+        // (1) listCollections：列全部 collection + payload 摘要
+        if (args.listCollections) {
+          const cols = _loadCols();
+          const names = Object.keys(cols);
+          if (names.length === 0) return "(No collections yet - use save=true + collection + name + url to create the first one)";
+          return "Collections (" + names.length + "):\n" + names.map(n => {
+            const ps = cols[n].payloads || [];
+            return `📁 ${n} (${ps.length} payloads)\n` + ps.map(p => `  - ${p.name} [${p.method}] ${p.url}`).join("\n");
+          }).join("\n\n");
+        }
+
+        // (2) save：把這次要的 payload 存進 collection（同名覆蓋）
+        if (args.save) {
+          if (!tCollection || !tPayloadName || !tUrl0) return "Error: save requires collection + name + url (method/headers/body optional)";
+          if (!/^https?:\/\//i.test(tUrl0)) return "Error: url must start with http:// or https://";
+          const rawH = (args.headers && typeof args.headers === "object" && !Array.isArray(args.headers)) ? args.headers : {};
+          const headerArr = Object.entries(rawH).map(([k, v]) => ({ key: k, value: v, enabled: true }));
+          const cols = _loadCols();
+          if (!cols[tCollection]) cols[tCollection] = { name: tCollection, createdAt: new Date().toISOString(), payloads: [] };
+          const col = cols[tCollection];
+          const entry = {
+            id: `pl-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            name: tPayloadName,
+            method: tMethod0,
+            url: tUrl0,
+            headers: headerArr,
+            body: args.body !== undefined && args.body !== null ? String(args.body) : "",
+            streamMode: false,
+            createdAt: new Date().toISOString(),
+          };
+          const idx = col.payloads.findIndex(x => x.name === tPayloadName);
+          if (idx >= 0) { entry.id = col.payloads[idx].id; entry.createdAt = col.payloads[idx].createdAt; col.payloads[idx] = entry; }
+          else col.payloads.push(entry);
+          col.updatedAt = new Date().toISOString();
+          try { writeSync(_collectionsFile(), JSON.stringify(cols, null, 2)); } catch (e) { return `Error saving collection: ${e.message}`; }
+          return `💾 Saved "${tPayloadName}" [${tMethod0}] into collection "${tCollection}" (${col.payloads.length} payloads) - the human can see/replay it in API Tester → Collections tab.`;
+        }
+
+        // (3) run by collection+name（無 url）：從 collection 讀 payload 執行
+        let tUrl = tUrl0, tMethod = tMethod0, ranFromCollection = null;
+        if (!tUrl && tCollection && tPayloadName) {
+          const cols = _loadCols();
+          const col = cols[tCollection];
+          if (!col) return `Error: collection "${tCollection}" not found. Use listCollections=true to see available collections.`;
+          const p = (col.payloads || []).find(x => x.name === tPayloadName);
+          if (!p) return `Error: payload "${tPayloadName}" not found in collection "${tCollection}". Available: ${(col.payloads || []).map(x => x.name).join(", ") || "(none)"}`;
+          tUrl = String(p.url || "").trim();
+          tMethod = String(p.method || "GET").toUpperCase();
+          // headers: [{key,value,enabled}] → object
+          const hdrs = {};
+          for (const h of (p.headers || [])) { if (h && h.key && h.enabled !== false) hdrs[h.key] = h.value; }
+          args = { ...args, headers: hdrs, body: p.body !== undefined && p.body !== null ? String(p.body) : args.body };
+          ranFromCollection = tCollection;
+        }
+        if (!tUrl) return "Error: url is required for api_test (or provide collection + name to run a saved payload)";
+        if (!/^https?:\/\//i.test(tUrl)) return "Error: url must start with http:// or https://";
+
+        if (onEvent) onEvent({ type: "tool_start", name, args: `${tMethod} ${tUrl}` });
+
+        // headers: object → 略過 content-length 之類會被 fetch 拒統的
+        const rawHeaders = (args.headers && typeof args.headers === "object" && !Array.isArray(args.headers)) ? args.headers : {};
+        const reqHeaders = {};
+        for (const [k, v] of Object.entries(rawHeaders)) {
+          const lk = String(k).toLowerCase();
+          if (lk === "content-length" || lk === "host") continue; // fetch 會拒絕/覆寫
+          reqHeaders[String(k)] = String(v);
+        }
+        const tBody = args.body !== undefined && args.body !== null ? String(args.body) : undefined;
+        const expectStatus = args.expectStatus || null;
+        const expectText = args.expectText || null;
+
+        const startTime = Date.now();
+        try {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 20_000);
+          const fetchOpts = { method: tMethod, headers: reqHeaders, redirect: "follow", signal: controller.signal };
+          if (tBody && tMethod !== "GET" && tMethod !== "HEAD") fetchOpts.body = tBody;
+          const tRes = await fetch(tUrl, fetchOpts);
+          clearTimeout(timer);
+          const elapsed = Date.now() - startTime;
+
+          const respHeaders = {};
+          tRes.headers.forEach((v, k) => { respHeaders[k] = v; });
+          const contentType = tRes.headers.get("content-type") || "";
+          let respBody;
+          if (contentType.includes("json") || contentType.includes("text") || contentType.includes("xml") || contentType.includes("html") || contentType.includes("javascript")) {
+            respBody = await tRes.text();
+          } else {
+            const buf = await tRes.arrayBuffer();
+            respBody = `[Binary data: ${buf.byteLength} bytes]`;
+          }
+
+          // ── 存入共用 API Tester history(跟 UI 同一份檔、同一形狀)──
+          // UI 存的 headers 是 [{key,value,enabled}] - 沿用同形狀,人點回來才能 replay
+          const headerArr = Object.entries(reqHeaders).map(([k, v]) => ({ key: k, value: v, enabled: true }));
+          const histItem = {
+            id: `req-${Date.now()}`,
+            ts: new Date().toISOString(),
+            method: tMethod,
+            url: tUrl,
+            status: tRes.status,
+            elapsed,
+            headers: headerArr,
+            body: tBody || "",
+            streamMode: false,
+            response: { status: tRes.status, statusText: tRes.statusText, headers: respHeaders, body: respBody, elapsed, size: respBody.length },
+            source: "agent",
+            agent: agentId || undefined,
+            collection: ranFromCollection || undefined,
+          };
+          try {
+            const histFile = resolve(DATA_HOME, "api-tester-history.json");
+            let hist = [];
+            try { hist = JSON.parse(readSync(histFile, "utf-8")); } catch {}
+            hist.unshift(histItem);
+            if (hist.length > 100) hist = hist.slice(0, 100);
+            writeSync(histFile, JSON.stringify(hist, null, 2));
+          } catch {}
+
+          // ── Report ──
+          let report = `${tMethod} ${tUrl}\n`;
+          if (ranFromCollection) report = `📁 collection "${ranFromCollection}"
+` + report;
+          report += `Status: ${tRes.status} ${tRes.statusText}\n`;
+          report += `Elapsed: ${elapsed}ms · Body: ${respBody.length} chars\n`;
+          if (expectStatus !== null) {
+            report += tRes.status === expectStatus
+              ? `✅ Status ${tRes.status} matches expected ${expectStatus}\n`
+              : `❌ Status ${tRes.status} does NOT match expected ${expectStatus}\n`;
+          }
+          if (expectText) {
+            report += respBody.includes(expectText)
+              ? `✅ Found expected text: "${expectText.slice(0, 60)}"\n`
+              : `❌ Expected text not found: "${expectText.slice(0, 60)}"\n`;
+          }
+          report += `\n📜 Saved to API Tester history (visible in UI 🌐 API Tester → 📜).\n\n--- Body (first 2500 chars) ---\n${respBody.slice(0, 2500)}`;
+          if (respBody.length > 2500) report += `\n... (${respBody.length - 2500} more chars)`;
+
+          if (onEvent) onEvent({ type: "tool_end", name, result: `${tRes.status} ${tRes.statusText} (${elapsed}ms)` });
+          return report;
+        } catch (err) {
+          const elapsed = Date.now() - startTime;
+          const errMsg = err.name === "AbortError" ? `timed out after 20s` : String(err.message || err);
+          // 失敗也記錄(status 0)- 人看得到 agent 打了什麼失敗
+          try {
+            const histFile = resolve(DATA_HOME, "api-tester-history.json");
+            let hist = [];
+            try { hist = JSON.parse(readSync(histFile, "utf-8")); } catch {}
+            hist.unshift({
+              id: `req-${Date.now()}`, ts: new Date().toISOString(), method: tMethod, url: tUrl,
+              status: 0, elapsed, headers: Object.entries(reqHeaders).map(([k, v]) => ({ key: k, value: v, enabled: true })),
+              body: tBody || "", streamMode: false,
+              response: { status: 0, statusText: "Network Error", headers: {}, body: errMsg, elapsed, size: 0, error: true },
+              source: "agent", agent: agentId || undefined,
+            });
+            if (hist.length > 100) hist = hist.slice(0, 100);
+            writeSync(histFile, JSON.stringify(hist, null, 2));
+          } catch {}
+          if (onEvent) onEvent({ type: "tool_error", name, error: errMsg });
+          return `❌ ${tMethod} ${tUrl} failed after ${elapsed}ms: ${errMsg}\n(Also saved to API Tester history with status 0.)`;
+        }
+      }
+
       // ══════════════════════════════════════════
       // ── Real Browser Tools (Playwright) ──
       case "browser_navigate": {
         const url = assertSafeUrl(args.url);
         if (onEvent) onEvent({ type: "tool_start", name, args: url });
         try {
-          const page = await getBrowserPage(DATA_HOME);
-          trackPage(page);
+          const page = await getBrowserPage(resolveBrowserKey(cwd));
+          trackPage(resolveBrowserKey(cwd), page);
           await page.goto(url, { waitUntil: "domcontentloaded" });
           await page.waitForTimeout(args.waitMs ?? 800);
           const title = await page.title().catch(() => "(no title)");
           const excerpt = (await readPageText(page, 1500)) || "(empty page)";
+          const nvShot = await takeActionShot(resolveBrowserKey(cwd), page).catch(() => null);
+          recordBrowserAction(resolveBrowserKey(cwd), { actor: "agent", kind: "navigate", summary: `載入「${title}」`, url: page.url(), shot: nvShot });
           if (onEvent) onEvent({ type: "tool_end", name, result: title });
           return `✅ Loaded: ${title}\nURL: ${page.url()}\n\n--- Text excerpt ---\n${excerpt}\n\nUse browser_read for full content, browser_screenshot for visual capture.`;
         } catch (navErr) {
@@ -1989,9 +2594,10 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
       case "browser_read": {
         if (onEvent) onEvent({ type: "tool_start", name, args: {} });
         try {
-          const page = await getBrowserPage(DATA_HOME);
-          trackPage(page);
+          const page = await getBrowserPage(resolveBrowserKey(cwd));
+          trackPage(resolveBrowserKey(cwd), page);
           const text = await readPageText(page, Math.min(args.maxLength || 8000, 20000));
+          recordBrowserAction(resolveBrowserKey(cwd), { actor: "agent", kind: "read", summary: `讀取頁面文字(${text.length} 字)`, url: page.url() });
           if (onEvent) onEvent({ type: "tool_end", name, result: `${text.length} chars` });
           return `URL: ${page.url()}\n\n${text || "(empty page)"}`;
         } catch (readErr) {
@@ -2003,20 +2609,21 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
       case "browser_screenshot": {
         if (onEvent) onEvent({ type: "tool_start", name, args: {} });
         try {
-          const page = await getBrowserPage(DATA_HOME);
-          trackPage(page);
-          const path = await takeScreenshot(DATA_HOME, page);
-          // Vision Phase 3（2026-08-30）：多拍一張 jpeg q80 給 LLM 看（png 留給 IDE Browser tab 人看）
-          // 標記由 agent loop 攔截 → 圖進 message；沒 vision 能力時降級為文字提示
+          const page = await getBrowserPage(resolveBrowserKey(cwd));
+          trackPage(resolveBrowserKey(cwd), page);
+          const path = await takeScreenshot(resolveBrowserKey(cwd), page);
+          // Vision Phase 3(2026-08-30):多拍一張 jpeg q80 給 LLM 看(png 留給 IDE Browser tab 人看)
+          // 標記由 agent loop 攔截 → 圖進 message;沒 vision 能力時降級為文字提示
+          recordBrowserAction(resolveBrowserKey(cwd), { actor: "agent", kind: "screenshot", summary: "截圖存證", url: page.url() });
           let visionMarker = "";
           try {
-            const shotDir = join(LOG_HOME, "browser");
+            const shotDir = browserShotDir(resolveBrowserKey(cwd));
             const visionPath = join(shotDir, `shot-${Date.now()}.vision.jpg`);
             await page.screenshot({ path: visionPath, type: "jpeg", quality: 80, fullPage: false });
             visionMarker = `\n[[PAAW_IMAGE:${visionPath.split(/[\\/]/).join("/")}]]`;
           } catch { /* vision copy 失敗不影響主截圖 */ }
           if (onEvent) onEvent({ type: "tool_end", name, result: path });
-          return `📸 Screenshot saved: ${path}${visionMarker}\nPNG 存檔（人看）：IDE Browser tab。若 vision 可用，畫面已直接附在你的上下文裡 — 請描述你看到的內容做視覺驗證；看不到圖就用 browser_read 讀文字。`;
+          return `📸 Screenshot saved: ${path}${visionMarker}\nPNG 存檔(人看):IDE Browser tab。若 vision 可用,畫面已直接附在你的上下文裡 - 請描述你看到的內容做視覺驗證;看不到圖就用 browser_read 讀文字。`;
         } catch (shotErr) {
           const hint = /playwright|Cannot find module/i.test(shotErr?.message || "") ? `\n\n${PLAYWRIGHT_INSTALL_HINT}` : "";
           if (onEvent) onEvent({ type: "tool_error", name, error: shotErr.message });
@@ -2026,11 +2633,17 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
       case "browser_click": {
         if (onEvent) onEvent({ type: "tool_start", name, args });
         try {
-          const page = await getBrowserPage(DATA_HOME);
-          trackPage(page);
+          const page = await getBrowserPage(resolveBrowserKey(cwd));
+          trackPage(resolveBrowserKey(cwd), page);
           const target = locateTarget(page, args);
-          await target.click({ timeout: 10_000 });
+          if (getVisualMode(resolveBrowserKey(cwd))) {
+            await visualClick(page, target); // 真人節奏:高亮 → 滑行 → 按壓(fallback 內建)
+          } else {
+            await target.click({ timeout: 10_000 });
+          }
           await page.waitForTimeout(600);
+          const ckShot = await takeActionShot(resolveBrowserKey(cwd), page).catch(() => null);
+          recordBrowserAction(resolveBrowserKey(cwd), { actor: "agent", kind: "click", summary: `點擊 ${args.selector || JSON.stringify(args.text)}`, url: page.url(), shot: ckShot });
           const excerpt = (await readPageText(page, 1200)) || "(empty)";
           if (onEvent) onEvent({ type: "tool_end", name, result: `clicked @ ${page.url()}` });
           return `✅ Clicked (${args.selector || JSON.stringify(args.text)})\nURL now: ${page.url()}\n\n--- Text excerpt ---\n${excerpt}`;
@@ -2043,12 +2656,20 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
       case "browser_type": {
         if (onEvent) onEvent({ type: "tool_start", name, args });
         try {
-          const page = await getBrowserPage(DATA_HOME);
-          trackPage(page);
+          const page = await getBrowserPage(resolveBrowserKey(cwd));
+          trackPage(resolveBrowserKey(cwd), page);
           const input = page.locator(args.selector).first();
-          await input.fill(String(args.text), { timeout: 10_000 });
+          if (getVisualMode(resolveBrowserKey(cwd))) {
+            // 真人節奏:游標滑到欄位點進去 → 清空 → 逐字打字(字間帶隨機延遲)
+            await visualClick(page, input);
+            await input.fill("", { timeout: 10_000 });
+            await input.pressSequentially(String(args.text), { delay: 55 + Math.floor(Math.random() * 35) });
+          } else {
+            await input.fill(String(args.text), { timeout: 10_000 });
+          }
           if (args.submit) await input.press("Enter");
           await page.waitForTimeout(600);
+          recordBrowserAction(resolveBrowserKey(cwd), { actor: "agent", kind: "type", summary: `輸入 ${args.selector} ← "${String(args.text).slice(0, 40)}"${args.submit ? " +Enter" : ""}`, url: page.url() });
           const excerpt = (await readPageText(page, 1200)) || "(empty)";
           if (onEvent) onEvent({ type: "tool_end", name, result: `typed into ${args.selector}` });
           return `✅ Typed into ${args.selector}${args.submit ? " + Enter" : ""}\nURL now: ${page.url()}\n\n--- Text excerpt ---\n${excerpt}`;
@@ -2056,6 +2677,34 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
           const hint = /playwright|Cannot find module/i.test(typeErr?.message || "") ? `\n\n${PLAYWRIGHT_INSTALL_HINT}` : "";
           if (onEvent) onEvent({ type: "tool_error", name, error: typeErr.message });
           return `❌ browser_type failed: ${typeErr.message}${hint}`;
+        }
+      }
+      // 2026-09-12:native select 下拉操作 - selectOption(label 或 value 二選一)
+      case "browser_select": {
+        if (onEvent) onEvent({ type: "tool_start", name, args: `${args.selector} → ${args.label || args.value}` });
+        try {
+          const page = await getBrowserPage(resolveBrowserKey(cwd));
+          trackPage(resolveBrowserKey(cwd), page);
+          const sel = page.locator(args.selector).first();
+          // 列出選項讓 agent 看得到有哪些(沒給 label/value 時直接回清單)
+          if (!args.label && !args.value) {
+            const opts = await sel.locator("option").evaluateAll(os => os.map(o => ({ value: o.value, label: o.textContent.trim(), selected: o.selected })));
+            if (onEvent) onEvent({ type: "tool_end", name, result: `${opts.length} options` });
+            return `Options in ${args.selector} (${opts.length}):\n${opts.map(o => `${o.selected ? "*" : " "} [${o.value}] ${o.label}`).join("\n")}\n(call again with label= or value= to select)`;
+          }
+          const choice = args.label !== undefined ? { label: String(args.label) } : { value: String(args.value) };
+          await sel.selectOption(choice, { timeout: 10_000 });
+          await page.waitForTimeout(400);
+          const chosen = await sel.inputValue();
+          const slShot = await takeActionShot(resolveBrowserKey(cwd), page).catch(() => null);
+          recordBrowserAction(resolveBrowserKey(cwd), { actor: "agent", kind: "select", summary: `下拉選 ${args.label || args.value}`, url: page.url(), shot: slShot });
+          const excerpt = (await readPageText(page, 1000)) || "(empty)";
+          if (onEvent) onEvent({ type: "tool_end", name, result: `selected ${chosen}` });
+          return `✅ Selected ${args.label || args.value} in ${args.selector} (current value: ${chosen})\nURL: ${page.url()}\n\n--- Text excerpt ---\n${excerpt.slice(0, 600)}`;
+        } catch (selErr) {
+          const hint = /playwright|Cannot find module/i.test(selErr?.message || "") ? `\n\n${PLAYWRIGHT_INSTALL_HINT}` : "";
+          if (onEvent) onEvent({ type: "tool_error", name, error: selErr.message });
+          return `❌ browser_select failed: ${selErr.message}${hint}`;
         }
       }
 
@@ -2155,13 +2804,13 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
               return `Features (${features.length}):\n\n${list}`;
             } catch (err) { return `Error reading features: ${err.message}`; }
           }
-          case "error_codes": { // 2026-09-05 v2：LLM 語意整理 — agent 寫碼前查既有 error 處理、helpdesk 從 code 追 feature
+          case "error_codes": { // 2026-09-05 v2:LLM 語意整理 - agent 寫碼前查既有 error 處理、helpdesk 從 code 追 feature
             const ecFile = join(cwd, ".paaw", "error-codes.json");
-            if (!existsSync(ecFile)) return "(No error-codes.json — CU error-codes 步驟未跑。請跑 CU 或請人類在 FeatureMap panel 🔢 整理。注意：整理會花 LLM token。)";
+            if (!existsSync(ecFile)) return "(No error-codes.json - CU error-codes 步驟未跑。請跑 CU 或請人類在 FeatureMap panel 🔢 整理。注意:整理會花 LLM token。)";
             try {
               const data = JSON.parse(readSync(ecFile, "utf-8"));
             if (onEvent) onEvent({ type: "tool_end", name: "project_info", result: `${data.stats?.uniqueCodes || 0} codes` });
-              // 🔍 反查（debug 入口）：錯誤碼/訊息片段 → feature + file:line
+              // 🔍 反查(debug 入口):錯誤碼/訊息片段 → feature + file:line
               if (args.search) {
                 const q = String(args.search).toLowerCase();
                 const hit = (c) => (c.code || "").toLowerCase().includes(q) || (c.message || "").toLowerCase().includes(q) || (c.file || "").toLowerCase().includes(q);
@@ -2172,17 +2821,17 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
                 }
                 const unmappedHits = (data.unmapped || []).filter(hit);
                 if (!groups.length && !unmappedHits.length) {
-                  return `🔍 沒有 hit「${args.search}」。建議：換更短的穩定片段（code 前綴或訊息關鍵字，避開變數值），或不帶 search 列出全部。`;
+                  return `🔍 沒有 hit「${args.search}」。建議:換更短的穩定片段(code 前綴或訊息關鍵字,避開變數值),或不帶 search 列出全部。`;
                 }
-                const lines = [`🔍 error codes 反查「${args.search}」：`];
+                const lines = [`🔍 error codes 反查「${args.search}」:`];
                 for (const { g, matched } of groups.slice(0, 10)) {
-                  lines.push(``, `[${g.featureId}] ${g.featureName}${g.summary ? ` — ${g.summary.slice(0, 80)}` : ""}`);
+                  lines.push(``, `[${g.featureId}] ${g.featureName}${g.summary ? ` - ${g.summary.slice(0, 80)}` : ""}`);
                   for (const c of matched.slice(0, 8)) {
                     lines.push(`  ${c.code || `(無code)`}${c.message ? `「${c.message}」` : ""} @${c.file}${c.line ? ":" + c.line : ""}${c.httpStatus ? ` [HTTP ${c.httpStatus}]` : ""}${c.kind === "throw" ? " (throw)" : ""}`);
                   }
                 }
                 if (unmappedHits.length) {
-                  lines.push(``, `(unmapped — 不屬於任何 feature:)`);
+                  lines.push(``, `(unmapped - 不屬於任何 feature:)`);
                   for (const c of unmappedHits.slice(0, 5)) lines.push(`  ${c.code || `(無code)`}${c.message ? `「${c.message}」` : ""} @${c.file}${c.line ? ":" + c.line : ""}`);
                 }
                 return lines.join("\n");
@@ -2190,37 +2839,37 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
               if (args.feature) {
                 const g = (data.byFeature || []).find(f => f.featureId === args.feature || f.featureName?.toLowerCase().includes(String(args.feature).toLowerCase()));
                 if (!g) return `(No error codes found for feature '${args.feature}')`;
-                const lines = (g.codes || []).map(c => `  ${c.code || `(無code) ${c.message}`} — ${c.file}${c.line ? ":" + c.line : ""}${c.httpStatus ? ` [HTTP ${c.httpStatus}]` : ""}${c.kind === "throw" ? " (throw)" : ""}`);
-                return `Error handling for [${g.featureId}] ${g.featureName} (${g.uniqueCount} unique)${g.summary ? `\n摘要：${g.summary}` : ""}\n${lines.join("\n")}`;
+                const lines = (g.codes || []).map(c => `  ${c.code || `(無code) ${c.message}`} - ${c.file}${c.line ? ":" + c.line : ""}${c.httpStatus ? ` [HTTP ${c.httpStatus}]` : ""}${c.kind === "throw" ? " (throw)" : ""}`);
+                return `Error handling for [${g.featureId}] ${g.featureName} (${g.uniqueCount} unique)${g.summary ? `\n摘要:${g.summary}` : ""}\n${lines.join("\n")}`;
               }
               const head = (data.byFeature || []).slice(0, args.limit ? Number(args.limit) : 15).map(g =>
                 `[${g.featureId}] ${g.featureName}: ${g.uniqueCount || (g.codes || []).length} codes`);
-              const extra = (data.byFeature || []).length > 15 ? `\n... 共 ${data.byFeature.length} 個 feature（帶 feature 參數看單一 feature）` : "";
-              const rec = data.recommendation?.suggest ? `\n⚠️ 建議導入 Error Code Rules v1（plan 詳見 error-codes.json / FeatureMap panel）` : "";
-              return `Error codes by feature (${data.stats?.uniqueCodes || 0} unique / ${data.byFeature?.length || 0} features / conventions: ${data.conventions || "unknown"})${data.conventionNote ? `\n慣例：${data.conventionNote}` : ""}${rec}\n${head.join("\n")}${extra}\nunmapped: ${(data.unmapped || []).length}`;
+              const extra = (data.byFeature || []).length > 15 ? `\n... 共 ${data.byFeature.length} 個 feature(帶 feature 參數看單一 feature)` : "";
+              const rec = data.recommendation?.suggest ? `\n⚠️ 建議導入 Error Code Rules v1(plan 詳見 error-codes.json / FeatureMap panel)` : "";
+              return `Error codes by feature (${data.stats?.uniqueCodes || 0} unique / ${data.byFeature?.length || 0} features / conventions: ${data.conventions || "unknown"})${data.conventionNote ? `\n慣例:${data.conventionNote}` : ""}${rec}\n${head.join("\n")}${extra}\nunmapped: ${(data.unmapped || []).length}`;
             } catch (err) { return `Error reading error-codes: ${err.message}`; }
           }
-          case "c4_model": { // 2026-09-05：對外連線全景 — ops/handover/architect 查 RU 連哪些 DB/服務
+          case "c4_model": { // 2026-09-05:對外連線全景 - ops/handover/architect 查 RU 連哪些 DB/服務
             const c4File = join(cwd, ".paaw", "c4-model.json");
-            if (!existsSync(c4File)) return "(No c4-model.json — CU c4-model 步驟未跑。請跑 CU 或請人類在 Code Intel → Architecture tab 整理。注意：組裝會花 LLM token。)";
+            if (!existsSync(c4File)) return "(No c4-model.json - CU c4-model 步驟未跑。請跑 CU 或請人類在 Code Intel → Architecture tab 整理。注意:組裝會花 LLM token。)";
             try {
               const data = JSON.parse(readSync(c4File, "utf-8"));
             if (onEvent) onEvent({ type: "tool_end", name: "project_info", result: `${data.stats?.external || 0} external` });
-              const fmt = (c) => `  ${c.name} [${c.type || "?"}]${c.technology ? ` (${c.technology})` : ""} — ${c.description || ""}${c.evidence?.length ? ` | 證據: ${c.evidence.slice(0, 3).join("; ")}` : ""}`;
+              const fmt = (c) => `  ${c.name} [${c.type || "?"}]${c.technology ? ` (${c.technology})` : ""} - ${c.description || ""}${c.evidence?.length ? ` | 證據: ${c.evidence.slice(0, 3).join("; ")}` : ""}`;
               if (args.search) {
                 const q = String(args.search).toLowerCase();
                 const hit = (c) => [c.name, c.type, c.technology, c.description, ...(c.evidence || [])].join(" ").toLowerCase().includes(q);
                 const cont = (data.containers || []).filter(hit);
                 const ext = (data.externalSystems || []).filter(hit);
                 const rel = (data.relationships || []).filter(r => `${r.from} ${r.to} ${r.protocol} ${r.description}`.toLowerCase().includes(q));
-                if (!cont.length && !ext.length && !rel.length) return `🔍 c4 沒有 hit「${args.search}」。試更短的關鍵字（如 redis、db、佇列）。`;
-                const lines = [`🔍 C4 搜尋「${args.search}」：`];
+                if (!cont.length && !ext.length && !rel.length) return `🔍 c4 沒有 hit「${args.search}」。試更短的關鍵字(如 redis、db、佇列)。`;
+                const lines = [`🔍 C4 搜尋「${args.search}」:`];
                 if (cont.length) { lines.push(``, `Containers:`); cont.forEach(c => lines.push(fmt(c))); }
                 if (ext.length) { lines.push(``, `External systems:`); ext.forEach(c => lines.push(fmt(c))); }
-                if (rel.length) { lines.push(``, `Relationships:`); rel.forEach(r => lines.push(`  ${r.from} → ${r.to} (${r.protocol || "?"}) — ${r.description || ""}`)); }
+                if (rel.length) { lines.push(``, `Relationships:`); rel.forEach(r => lines.push(`  ${r.from} → ${r.to} (${r.protocol || "?"}) - ${r.description || ""}`)); }
                 return lines.join("\n");
               }
-              const lines = [`# C4 對外連線：${data.system?.name || ""}`, data.system?.description || "", "", "## Containers", ...(data.containers || []).map(fmt), "", "## External systems", ...(data.externalSystems || []).map(fmt), "", "## Relationships", ...(data.relationships || []).map(r => `  ${r.from} → ${r.to} (${r.protocol || "?"}) — ${r.description || ""}`)];
+              const lines = [`# C4 對外連線:${data.system?.name || ""}`, data.system?.description || "", "", "## Containers", ...(data.containers || []).map(fmt), "", "## External systems", ...(data.externalSystems || []).map(fmt), "", "## Relationships", ...(data.relationships || []).map(r => `  ${r.from} → ${r.to} (${r.protocol || "?"}) - ${r.description || ""}`)];
               if (data.notes) lines.push("", `Notes: ${data.notes}`);
               return lines.join("\n");
             } catch (err) { return `Error reading c4-model: ${err.message}`; }
@@ -2297,9 +2946,9 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
             } catch (err) { return `Error: ${err.message}`; }
           }
           case "security": {
-            // 2026-09-06 Fleming：QA/SA 要能看到 security scan 明細並開 task 單 — 補 cwe/snippet/references/feature 對應
+            // 2026-09-06 Fleming:QA/SA 要能看到 security scan 明細並開 task 單 - 補 cwe/snippet/references/feature 對應
             const secFile = join(cwd, ".paaw", "security", "scan-results.json");
-            if (!existsSync(secFile)) return "⚠️ Security scan results not found — 先跑 Security Scan（EM dashboard 或 CU security-scan step）。";
+            if (!existsSync(secFile)) return "⚠️ Security scan results not found - 先跑 Security Scan(EM dashboard 或 CU security-scan step)。";
             try {
               const sec = JSON.parse(readSync(secFile, "utf-8"));
               const total = (sec.findings || []).length;
@@ -2311,12 +2960,12 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
               if (args.file) { const norm = args.file.replace(/\\/g, "/"); findings = findings.filter(f => f.file?.replace(/\\/g, "/").includes(norm)); }
               if (args.search) { const q = String(args.search).toLowerCase(); findings = findings.filter(f => `${f.message || ""} ${f.id || ""} ${Array.isArray(f.cwe) ? f.cwe.join(" ") : f.cwe || ""}`.toLowerCase().includes(q)); }
               if (findings.length === 0) { if (onEvent) onEvent({ type: "tool_end", name: "project_info", result: "clean" }); return `No security findings${total ? " matching filter" : ""}. ✅`; }
-              // feature 對照（開 task 單掛 featureId 用）— FILE-FEATURES.json repo-relative key
+              // feature 對照(開 task 單掛 featureId 用)- FILE-FEATURES.json repo-relative key
               let fileFeatures = {};
               try { const ff = JSON.parse(readSync(join(cwd, ".paaw", "features", "FILE-FEATURES.json"), "utf-8")); fileFeatures = ff.files || {}; } catch {}
               const cwdN = cwd.replace(/\\/g, "/");
               const rel = (p) => { const n = String(p || "").replace(/\\/g, "/"); return n.startsWith(cwdN + "/") ? n.slice(cwdN.length + 1) : n; };
-              const header = `Security Findings（${findings.length}/${total}，scanned ${sec.scannedAt || "(unknown)"}${sec.stats?.bySeverity ? `，severity ${JSON.stringify(sec.stats.bySeverity)}` : ""}）`;
+              const header = `Security Findings(${findings.length}/${total},scanned ${sec.scannedAt || "(unknown)"}${sec.stats?.bySeverity ? `,severity ${JSON.stringify(sec.stats.bySeverity)}` : ""})`;
               const lines = findings.map(f => {
                 const rf = rel(f.file);
                 const rule = String(f.id || "").split(".").pop();
@@ -2324,10 +2973,10 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
                 const feats = (fileFeatures[rf] || []).map(x => x.id).join(",");
                 const snip = String(f.snippet || "").replace(/\s+/g, " ").slice(0, 120);
                 const refs = (f.references || []).slice(0, 1).join("");
-                return `- [${String(f.severity || "?").toUpperCase()}] ${rf}:${f.line || "?"}${cwe ? `｜${cwe}` : ""}${feats ? `｜feature: ${feats}` : ""}${f.confidence ? `｜confidence ${f.confidence}` : ""}\n  rule: ${rule}｜${f.message}${snip ? `\n  code: ${snip}` : ""}${refs ? `\n  ref: ${refs}` : ""}`;
+                return `- [${String(f.severity || "?").toUpperCase()}] ${rf}:${f.line || "?"}${cwe ? `|${cwe}` : ""}${feats ? `|feature: ${feats}` : ""}${f.confidence ? `|confidence ${f.confidence}` : ""}\n  rule: ${rule}|${f.message}${snip ? `\n  code: ${snip}` : ""}${refs ? `\n  ref: ${refs}` : ""}`;
               }).join("\n");
               if (onEvent) onEvent({ type: "tool_end", name: "project_info", result: `${findings.length} findings` });
-              return `${header}\n${lines}\n（開 task 修復時掛對應 featureId；severity/file/search 可過濾）`;
+              return `${header}\n${lines}\n(開 task 修復時掛對應 featureId;severity/file/search 可過濾)`;
             } catch (err) { return `Error: ${err.message}`; }
           }
           case "recent_changes": {
@@ -2350,18 +2999,38 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
             } catch (err) { return `Error: ${err.message}`; }
           }
           case "api_history": {
-            const histFile = join(rootDir, "data", "api-tester-history.json");
+            // 2026-09-12:DATA_HOME 爲單一事實來源(跟 api-tester route / api_test tool 同檔);
+            // 加 source 過濾 + detail 模式(回傳完整 headers/body - 拿人輸入過的資料產 e2e script)
+            const histFile = resolve(DATA_HOME, "api-tester-history.json");
             if (!existsSync(histFile)) return "No API Tester history found.";
             try {
               const raw = JSON.parse(readSync(histFile, "utf-8"));
               let items = Array.isArray(raw) ? raw : (raw.history || []);
+              if (args.source) items = items.filter(i => (i.source || "human") === args.source);
               if (args.method) items = items.filter(i => i.method?.toUpperCase() === args.method.toUpperCase());
               if (args.path_contains) { const needle = args.path_contains.toLowerCase(); items = items.filter(i => i.url?.toLowerCase().includes(needle)); }
+              // detail 模式:回傳單筆完整 request(headers/body/response)- e2e script 產生用
+              if (args.detail !== undefined && args.detail !== null && args.detail !== "") {
+                const d = args.detail;
+                const item = (typeof d === "string" && d.startsWith("req-"))
+                  ? items.find(i => i.id === d)
+                  : items[Number(d) - 1];
+                if (!item) return `No history entry for detail='${d}' (use api_history without detail to list).`;
+                const hArr = Array.isArray(item.headers) ? item.headers : Object.entries(item.headers || {}).map(([k, v]) => ({ key: k, value: String(v), enabled: true }));
+                const full = {
+                  id: item.id, ts: item.ts, source: item.source || "human", agent: item.agent,
+                  method: item.method, url: item.url, status: item.status, elapsed: item.elapsed,
+                  headers: hArr, body: item.body,
+                  response: item.response ? { status: item.response.status, statusText: item.response.statusText, body: String(item.response.body || "").slice(0, 2000) } : (item.streamResponse ? { status: item.status, body: String(item.streamResponse).slice(0, 2000) } : undefined),
+                };
+                if (onEvent) onEvent({ type: "tool_end", name: "project_info", result: `${item.method} ${item.url}` });
+                return `API History Entry (full request - for e2e script generation):\n${JSON.stringify(full, null, 2)}`;
+              }
               const limit = Math.min(args.limit || 20, 50);
               items = items.slice(0, limit);
               if (items.length === 0) return "No matching API history.";
               if (onEvent) onEvent({ type: "tool_end", name: "project_info", result: `${items.length} entries` });
-              return `API History (${items.length}):\n${items.map((item, idx) => `${idx+1}. ${item.method} ${item.url} → ${item.status} (${item.elapsed}ms)`).join("\n")}`;
+              return `API History (${items.length}):\n${items.map((item, idx) => `${idx+1}. [${item.source === "agent" ? "agent" : "human"}] ${item.method} ${item.url} → ${item.status} (${item.elapsed}ms)`).join("\n")}\n(tip: detail=<N or req-id> 回傳完整 headers/body - 拿人輸入過的資料產 e2e Playwright script;source=human|agent 過濾)`;
             } catch (err) { return `Error: ${err.message}`; }
           }
           default:
@@ -2372,7 +3041,7 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
 
 
       // ══════════════════════════════════════════
-      // ── Project Board（維護 data/projects/ — 一個 RU 對應一個 project）──
+      // ── Project Board(維護 data/projects/ - 一個 RU 對應一個 project)──
       // ══════════════════════════════════════════
 
       case "project_board": {
@@ -2419,7 +3088,7 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
           await mkdir(PROJECTS_DIR, { recursive: true });
           _saveProject(proj);
           if (onEvent) onEvent({ type: "tool_end", name, result: args.id });
-          return `✅ Created project ${args.id}: ${args.name}\n⚠️ 記得設定 aliases（本機資料夾名）讓 agent 執行紀錄能對應 RU 成本。`;
+          return `✅ Created project ${args.id}: ${args.name}\n⚠️ 記得設定 aliases(本機資料夾名)讓 agent 執行紀錄能對應 RU 成本。`;
         }
 
         // 以下 actions 都需要 projectId
@@ -2508,26 +3177,26 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
           return "⚠️ .paaw/ not initialized. Run full Code Understanding first.";
         }
 
-        // Deterministic steps — always safe to re-run, no LLM needed
+        // Deterministic steps - always safe to re-run, no LLM needed
         if (steps.includes("code-intelligence")) {
           try {
             const { buildCodeIntelligence } = await import("./code-intelligence.mjs");
             const { summary } = await buildCodeIntelligence(cwd, _PAAW_ROOT);
             results.push(`🧠 Code Intelligence: ${summary.totalFunctions} functions, ${summary.totalRoutes} routes, ${summary.totalDependencies} deps`);
-          } catch (err) { results.push(`🧠 Code Intelligence: failed — ${err.message}`); }
+          } catch (err) { results.push(`🧠 Code Intelligence: failed - ${err.message}`); }
         }
         if (steps.includes("test-intelligence")) {
           try {
             const { buildTestIntelligence } = await import("./test-intelligence.mjs");
             const { summary } = await buildTestIntelligence(cwd, _PAAW_ROOT);
             results.push(`🧪 Test Intelligence: ${summary.totalTestFiles} tests, ${summary.coverageRate} coverage`);
-          } catch (err) { results.push(`🧪 Test Intelligence: failed — ${err.message}`); }
+          } catch (err) { results.push(`🧪 Test Intelligence: failed - ${err.message}`); }
         }
 
-        // LLM steps — these re-run the CU step via API (requires server running)
+        // LLM steps - these re-run the CU step via API (requires server running)
         const llmSteps = steps.filter(s => !["code-intelligence", "test-intelligence"].includes(s));
         if (llmSteps.length > 0) {
-          results.push(`\n⚠️ LLM steps (${llmSteps.join(", ")}) require calling POST /api/coding-project/ai-initial-step — use from Coding IDE or auto dispatch.`);
+          results.push(`\n⚠️ LLM steps (${llmSteps.join(", ")}) require calling POST /api/coding-project/ai-initial-step - use from Coding IDE or auto dispatch.`);
         }
 
         const output = results.length > 0 ? `CU Refresh Results:\n${results.join("\n")}` : "No steps to refresh.";
@@ -2542,7 +3211,7 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
       case "record_decision": {
         const paaw = createPaawProject(cwd);
         if (!paaw.exists) {
-          return "⚠️ .paaw/ not initialized. Decision not recorded. (This is OK — the decision is still captured in the session log.)";
+          return "⚠️ .paaw/ not initialized. Decision not recorded. (This is OK - the decision is still captured in the session log.)";
         }
         const result = await paaw.addDecision({
           title: args.title,
@@ -2558,7 +3227,7 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
       case "docs": {
         const action = args.action;
         if (!action) return "Error: action is required. Valid: changelog, write, append";
-        
+
         if (action === "changelog") {
           const paaw = createPaawProject(cwd);
           if (!paaw.exists) return "⚠️ .paaw/ not initialized. Changelog not updated.";
@@ -2567,7 +3236,7 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
           if (onEvent) onEvent({ type: "tool_end", name, result: `${args.type}: ${args.description.slice(0, 50)}` });
           return `✅ Changelog updated: [${args.type}] ${args.description}`;
         }
-        
+
         if (action === "write" || action === "append") {
           const paaw = createPaawProject(cwd);
           if (!paaw.exists) await paaw.init();
@@ -2583,8 +3252,110 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
           if (onEvent) onEvent({ type: "tool_end", name, result: docFile });
           return `✅ Documentation ${action === "append" ? "appended" : "updated"}: .paaw/${docFile}`;
         }
-        
+
         return `Unknown action '${action}'. Valid: changelog, write, append`;
+      }
+
+      // ── QA Results Tools(2026-09-17:qa agent 留記錄、全 agent 讀寫)──
+      case "qa_record_save": {
+        const { saveQaResult } = await import("./qa-results.mjs");
+        try {
+          const record = saveQaResult(cwd, { ...args, actor: agentId || "human" });
+          if (onEvent) onEvent({ type: "tool_end", name, result: `${record.verdict} - ${record.target}` });
+          return `✅ QA result recorded: ${record.id} [${record.verdict}] ${record.target}\nStatus: ${record.status} | Issues: ${record.issues.length}\nSaved to .paaw/coding-memory/qa-results.jsonl - visible to all agents and the human.`;
+        } catch (e) {
+          return `❌ qa_record_save failed: ${e.message}`;
+        }
+      }
+      case "qa_record_list": {
+        const { listQaResults } = await import("./qa-results.mjs");
+        const list = listQaResults(cwd, { ...args, limit: args.limit || 10 });
+        if (list.length === 0) return "No QA results found (adjust filters, or the log is empty - record tests with qa_record_save).";
+        return list.map((r) => {
+          const issues = (r.issues || []).map(x => `    [${x.severity}]${x.status === "open" ? "🔴" : "✅"} ${x.desc}`).join("\n");
+          return `${r.id} [${r.verdict}/${r.status}] ${r.type} · ${r.target}\n   ${new Date(r.ts).toLocaleString()} by ${r.actor} - ${r.summary.slice(0, 150)}${issues ? "\n" + issues : ""}`;
+        }).join("\n\n");
+      }
+      case "qa_record_update": {
+        const { updateQaResult } = await import("./qa-results.mjs");
+        const rec = updateQaResult(cwd, args.id, args, agentId || "human");
+        if (!rec) return `❌ QA result not found: ${args.id} (use qa_record_list to find the id)`;
+        if (onEvent) onEvent({ type: "tool_end", name, result: `${rec.id} → ${rec.status}` });
+        return `✅ Updated ${rec.id}: status=${rec.status}\nIssues: ${(rec.issues || []).map(x => `${x.status === "open" ? "🔴" : "✅"} ${x.desc.slice(0, 60)}`).join(" | ")}`;
+      }
+
+      // ── Release Request Tools(v3 2026-09-18:RM agent 審證據、寫建議,人類確認)──
+      case "rr_list": {
+        const { listReleaseRequests } = await import("./release-requests.mjs");
+        let list = await listReleaseRequests(cwd);
+        if (args.status) list = list.filter(r => r.status === args.status);
+        if (list.length === 0) return "No release requests found. (Create one from the Release Manager UI - 📋 Release Requests section.)";
+        return list.map(r =>
+          `${r.id} [${r.status}] ${r.title}\n   ${r.baseline?.short || "?"} → ${r.target?.short || "?"} · ${r.scope?.commits ?? 0} commits / ${r.scope?.files ?? 0} files / ${r.scope?.tasks ?? 0} tasks\n   checklist: ${(r.checklist || []).map(c => `${c.id}=${c.verdict}(auto:${c.auto})`).join(" · ")}${r.releaseId ? `\n   → ${r.releaseId}` : ""}`
+        ).join("\n\n");
+      }
+      case "rr_get": {
+        const { getReleaseRequest } = await import("./release-requests.mjs");
+        const rr = await getReleaseRequest(cwd, args.id);
+        if (!rr) return `❌ Release request not found: ${args.id} (use rr_list)`;
+        const cl = (rr.checklist || []).map(c =>
+          `  [${c.id}] verdict=${c.verdict} · auto=${c.auto?.status || "?"}\n    detail: ${c.auto?.detail || "-"}${c.note ? `\n    note: ${c.note}` : ""}${rr.suggested?.[c.id] ? `\n    🤖 suggested: ${rr.suggested[c.id].verdict} - ${rr.suggested[c.id].reason}` : ""}`
+        ).join("\n");
+        const feats = (rr.scope?.features || []).map(f => `  ${f.id} ${f.name}${f.hasTests ? "" : " (NO TESTS)"}${f.apiImpact ? " [API impact]" : ""}`).join("\n");
+        return [
+          `${rr.id} [${rr.status}] ${rr.title}`,
+          `baseline: ${rr.baseline?.short}(${rr.baseline?.source})${rr.baseline?.subject || ""}`,
+          `target:  ${rr.target?.short} ${rr.target?.subject || ""}`,
+          `scope:   ${rr.scope?.commits?.count ?? 0} commits · ${(rr.scope?.files || []).length} files · ${(rr.scope?.features || []).length} features · ${(rr.scope?.apis || []).length} APIs · ${(rr.scope?.taskIds || []).length} pending tasks`,
+          `authors: ${(rr.scope?.commits?.authors || []).join(", ")}`,
+          "",
+          "Checklist (auto = deterministic evidence):",
+          cl,
+          "",
+          "Changed features:",
+          feats || "  (none)",
+          "",
+          "Recent commits:",
+          (rr.scope?.commits?.subjects || []).slice(0, 10).map(s => `  ${s}`).join("\n") || "  (none)",
+          "",
+          "Scope pending tasks (will batch-release on close):",
+          (rr.scope?.taskIds || []).map(x => `  ${typeof x === "string" ? x : `${x.id} ${x.title}`}`).join("\n") || "  (none)",
+        ].join("\n");
+      }
+      case "rr_suggest": {
+        const { suggestVerdicts } = await import("./release-requests.mjs");
+        try {
+          const rr = await suggestVerdicts(cwd, args.id, args.items, agentId || "rm-agent");
+          if (onEvent) onEvent({ type: "tool_end", name, result: `${rr.id}: ${args.items.length} items` });
+          return `✅ Suggestions recorded on ${rr.id} (${args.items.map(it => `${it.itemId}:${it.verdict}`).join(", ")}).\nThe human will confirm in the Release Manager UI - you suggested, you did NOT decide.`;
+        } catch (e) {
+          return `❌ rr_suggest failed: ${e.message}`;
+        }
+      }
+
+      case "rr_create": {
+        const { createReleaseRequest, listReleaseRequests } = await import("./release-requests.mjs");
+        try {
+          const existing = (await listReleaseRequests(cwd)).filter(r => r.status === "draft" || r.status === "reviewing");
+          if (existing.length > 0) {
+            return `⚠️ 已有進行中的 RR,不自動多開(避免重複放行範圍):
+${existing.map(r => `${r.id} [${r.status}] ${r.title}`).join("\n")}
+
+請人類決定:用這張繼續(rr_get 看證據 → rr_suggest 給建議),或先在 UI 處理掉再建新的。`;
+          }
+          const rr = await createReleaseRequest(cwd, {
+            title: args.title,
+            baseline: args.baseline || "auto",
+            createdBy: `agent:${agentId || "em"}`,
+          });
+          if (onEvent) onEvent({ type: "tool_end", name, result: `${rr.id} draft` });
+          return `✅ 已建立 RR 草稿:${rr.id} 「${rr.title}」
+baseline ${rr.baseline?.short}(${rr.baseline?.source})→ target ${rr.target?.short} · ${rr.scope?.commits?.count ?? 0} commits / ${(rr.scope?.files || []).length} files
+
+下一步:rr_get ${rr.id} 讀證據 → rr_suggest 給建議 → 人類在 Release Manager UI 確認結案(你只建議,不放行)。`;
+        } catch (e) {
+          return `❌ rr_create failed: ${e.message}`;
+        }
       }
 
       // ── Action Log Tools ──
@@ -2604,9 +3375,9 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
       }
 
       // ── Agent Memory Tools ──
-      // 2026-09-07 修正：coding crew 的 memory 跟專案走（cwd），不是 PAAW root
-      // （之前 rootDir||cwd → crew chat 的 rootDir=PAAW_ROOT → memory 存到 PAAW 根，
-      //   EM auto-dispatch 讀專案根 → 永遠讀不到，agentMemoryInjected 永遠 (none)）
+      // 2026-09-07 修正:coding crew 的 memory 跟專案走(cwd),不是 PAAW root
+      // (之前 rootDir||cwd → crew chat 的 rootDir=PAAW_ROOT → memory 存到 PAAW 根,
+      //   EM auto-dispatch 讀專案根 → 永遠讀不到,agentMemoryInjected 永遠 (none))
       case "agent_memory_save": {
         const { saveAgentMemory } = await import("./action-log.mjs");
         const agentId2 = args._agentId || _agentCfg?.agentId || agentId || "agent";
@@ -2626,8 +3397,8 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
       }
 
       case "conversation_history": {
-        // 2026-09-06 Fleming：每個 agent 都能查過去聊天記錄（.paaw/coding-memory/conversations/）
-        // RU 開發紀錄全保留 — active.json 為進行中，s-*.json 為封存 session
+        // 2026-09-06 Fleming:每個 agent 都能查過去聊天記錄(.paaw/coding-memory/conversations/)
+        // RU 開發紀錄全保留 - active.json 為進行中,s-*.json 為封存 session
         const base = rootDir || cwd;
         const convRoot = join(base, ".paaw", "coding-memory", "conversations");
         const myAgentId = args._agentId || _agentCfg?.agentId || "agent";
@@ -2652,14 +3423,14 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
           if (!items.length) return "(尚無對話記錄)";
           const lines = items.map(it => `  ${it.id.padEnd(24)} ${fmtTime(it.meta?.lastUpdated || it.meta?.archivedAt)}  ${String(it.msgs.length).padStart(3)}則  ${(it.meta?.title || "").slice(0, 40)}`);
           if (onEvent) onEvent({ type: "tool_end", name, result: `${items.length} sessions` });
-          return `📁 ${targetCrew} sessions（時間序）：\n${lines.join("\n")}\n\n用 conversation_history(action="load", sessionId="s-...") 讀完整內容`;
+          return `📁 ${targetCrew} sessions(時間序):\n${lines.join("\n")}\n\n用 conversation_history(action="load", sessionId="s-...") 讀完整內容`;
         }
 
         if (args.action === "load") {
-          if (!args.sessionId || !safe(args.sessionId)) return "Error: load 需要 sessionId（先 list 取得；active=目前對話）";
+          if (!args.sessionId || !safe(args.sessionId)) return "Error: load 需要 sessionId(先 list 取得;active=目前對話)";
           const dir = join(convRoot, targetCrew);
           const file = args.sessionId === "active" ? "active.json" : `${args.sessionId}.json`;
-          if (!existsSync(join(dir, file))) return `找不到 session ${args.sessionId}（先 list 看有哪些）`;
+          if (!existsSync(join(dir, file))) return `找不到 session ${args.sessionId}(先 list 看有哪些)`;
           const d = readSess(dir, file);
           if (!d?.messages?.length) return "(空 session)";
           const lines = d.messages.map(m => {
@@ -2667,7 +3438,7 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
             return `[${fmtTime(m.ts)}] ${m.role === "user" ? "👤" : "🤖"}: ${c.slice(0, 600)}`;
           });
           if (onEvent) onEvent({ type: "tool_end", name, result: `${d.messages.length} msgs` });
-          return `📜 ${targetCrew}/${args.sessionId}（${d.messages.length} 則）\n${lines.join("\n")}`.slice(0, 12000);
+          return `📜 ${targetCrew}/${args.sessionId}(${d.messages.length} 則)\n${lines.join("\n")}`.slice(0, 12000);
         }
 
         if (args.action === "search") {
@@ -2693,7 +3464,7 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
             }
           }
           if (onEvent) onEvent({ type: "tool_end", name, result: `${hits.length} hits` });
-          return hits.length ? `🔍 「${args.query}」找到 ${hits.length} 筆：\n${hits.join("\n")}` : `🔍 「${args.query}」沒有找到`;
+          return hits.length ? `🔍 「${args.query}」找到 ${hits.length} 筆:\n${hits.join("\n")}` : `🔍 「${args.query}」沒有找到`;
         }
         return "Error: action 必須是 list / load / search";
       }
@@ -2726,7 +3497,7 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
                   notebooks.push({ id: nbId, name: nb.name || nbId, description: nb.description || "", sections: [{ id: "default", name: "Default" }, ...sections], noteCount: Array.isArray(nb.notes) ? nb.notes.length : 0 });
                 } catch {}
               }
-              const text = notebooks.map(nb => `📁 ${nb.name} (${nb.id}) — ${nb.noteCount} 筆記\n  分類: ${nb.sections.map(s => s.name).join(", ")}`).join("\n");
+              const text = notebooks.map(nb => `📁 ${nb.name} (${nb.id}) - ${nb.noteCount} 筆記\n  分類: ${nb.sections.map(s => s.name).join(", ")}`).join("\n");
               if (onEvent) onEvent({ type: "tool_end", name, result: `${notebooks.length} notebooks` });
               return text || "No notebooks found.";
             } catch { return "No notes directory found."; }
@@ -2742,7 +3513,7 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
               const nbFile = resolve(notesDir, `${args.notebookId}.json`);
               let noteCounts = {};
               try { const nb = JSON.parse(await readFile(nbFile, "utf-8")); for (const n of (nb.notes || [])) { const sid = n.sectionId || "default"; noteCounts[sid] = (noteCounts[sid] || 0) + 1; } } catch {}
-              const text = sections.map(s => `  ${s.id === "default" ? "📋" : "📁"} ${s.name} (${s.id}) — ${noteCounts[s.id] || 0} 筆記`).join("\n");
+              const text = sections.map(s => `  ${s.id === "default" ? "📋" : "📁"} ${s.name} (${s.id}) - ${noteCounts[s.id] || 0} 筆記`).join("\n");
               if (onEvent) onEvent({ type: "tool_end", name, result: `${sections.length} sections` });
               return `Notebook '${args.notebookId}' sections:\n${text}`;
             } catch { return `Notebook '${args.notebookId}' has only the Default section.`; }
@@ -2894,7 +3665,7 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
             log.push(entry);
             writeSync(logFile, JSON.stringify(log, null, 2));
             if (onEvent) onEvent({ type: "tool_end", name, result: args.title });
-            return `✅ Recorded change: ${args.title} (${args.type}) — ${args.files.length} file(s)`;
+            return `✅ Recorded change: ${args.title} (${args.type}) - ${args.files.length} file(s)`;
           }
 
           case "feature_update_docs": {
@@ -2912,19 +3683,19 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
             return `✅ Updated docs for ${args.id}: ${feature.name}`;
           }
 
-          // ── feature_delete：移除 feature 記錄（2026-09-06 Fleming：刪 feature 走 agent tool，人不在 UI 手刪）──
-          // 標準流程：SA（architect）開 task 叫 developer 刪掉相關程式碼並 stage → SA 確認後才刪 feature 記錄 → 程式與 feature map 同步
+          // ── feature_delete:移除 feature 記錄(2026-09-06 Fleming:刪 feature 走 agent tool,人不在 UI 手刪)──
+          // 標準流程:SA(architect)開 task 叫 developer 刪掉相關程式碼並 stage → SA 確認後才刪 feature 記錄 → 程式與 feature map 同步
           case "feature_delete": {
-            if (!args.id) return "Error: id is required（featureId，如 F20260901-001）";
+            if (!args.id) return "Error: id is required(featureId,如 F20260901-001)";
             const { loadFeatures, saveFeatures } = await import("./feature-registry.mjs");
             const features = await loadFeatures(cwd);
             const idx = features.findIndex(f => f.id === args.id);
-            if (idx < 0) return `Error: Feature ${args.id} not found（先 project_info(category="features") 確認 id）`;
+            if (idx < 0) return `Error: Feature ${args.id} not found(先 project_info(category="features") 確認 id)`;
             const deleted = features.splice(idx, 1)[0];
             await saveFeatures(cwd, features);
             const fileCount = (deleted.codeFiles || []).length;
             if (onEvent) onEvent({ type: "tool_end", name, result: `feature ${args.id} deleted` });
-            return `已刪除 feature ${args.id}「${deleted.name || ""}」（原映射 ${fileCount} 個檔案）。\n⚠️ 請確認：相關程式碼是否已由 developer 移除（task 已 stage/commit）？若還沒，請先開 task 處理，程式與 feature map 才會同步。`;
+            return `已刪除 feature ${args.id}「${deleted.name || ""}」(原映射 ${fileCount} 個檔案)。\n⚠️ 請確認:相關程式碼是否已由 developer 移除(task 已 stage/commit)?若還沒,請先開 task 處理,程式與 feature map 才會同步。`;
           }
 
           case "feature_update_mapping": {
@@ -2977,7 +3748,7 @@ export async function executeTool(call, cwd, rootDir, onEvent, agentId, featureB
           const data = JSON.parse(readSync(tasksFile, "utf-8"));
           let tasks = data.tasks || [];
           // Normalize old statuses for display
-          const norm = s => { const st = String(s||"").trim().toLowerCase().replace(/[\s-]+/g,"_"); if (st==="open"||st==="todo") return "open"; if (["in_progress","review","testing","pending","awaiting_human"].includes(st)) return "pending"; if (["done","completed","resolved","closed"].includes(st)) return "close"; if (["skipped","wontfix","ignore"].includes(st)) return "ignore"; return "open"; };
+          const norm = s => { const st = String(s||"").trim().toLowerCase().replace(/[\s-]+/g,"_"); if (st==="open"||st==="todo") return "open"; if (["in_progress","review","testing","pending","awaiting_human"].includes(st)) return "pending"; if (["done","completed","resolved","closed","close"].includes(st)) return "close"; if (["skipped","wontfix","ignore"].includes(st)) return "ignore"; return "open"; };
           const normType = t => { const ty = String(t||"").toLowerCase(); if (ty==="test"||ty==="testing") return "test"; if (ty==="docs"||ty==="doc"||ty==="documentation") return "docs"; return "dev"; };
           // Single task by ID
           if (args.id) {
@@ -3010,7 +3781,7 @@ ${lines}`;
       }
 
       case "task_create": {
-        // Feature-first：featureId 必填，status 只有 open/close/pending/ignore，type 只有 dev/test/docs
+        // Feature-first:featureId 必填,status 只有 open/close/pending/ignore,type 只有 dev/test/docs
         if (!args.featureId) {
           return "Error: featureId is required. Every task must belong to a feature (misc work → 'Utility & Platform Misc' feature).";
         }
@@ -3058,9 +3829,9 @@ Feature: ${task.featureId} | Type: ${task.type} | Priority: ${task.priority} | S
       }
 
       case "task_update": {
-        // Feature-first：no pipeline, 4 statuses, 3 types
+        // Feature-first:no pipeline, 4 statuses, 3 types
         const TASK_STATUSES = ["open", "close", "pending", "ignore"];
-        const normStatus = s => { const st = String(s||"").trim().toLowerCase().replace(/[\s-]+/g,"_"); if (st==="open"||st==="todo") return "open"; if (["in_progress","review","testing","pending","awaiting_human"].includes(st)) return "pending"; if (["done","completed","resolved","closed"].includes(st)) return "close"; if (["skipped","wontfix","ignore"].includes(st)) return "ignore"; return "open"; };
+        const normStatus = s => { const st = String(s||"").trim().toLowerCase().replace(/[\s-]+/g,"_"); if (st==="open"||st==="todo") return "open"; if (["in_progress","review","testing","pending","awaiting_human"].includes(st)) return "pending"; if (["done","completed","resolved","closed","close"].includes(st)) return "close"; if (["skipped","wontfix","ignore"].includes(st)) return "ignore"; return "open"; };
         const normType = t => { const ty = String(t||"").toLowerCase(); if (ty==="test"||ty==="testing") return "test"; if (ty==="docs"||ty==="doc"||ty==="documentation") return "docs"; return "dev"; };
         const tasksFile = join(cwd, ".paaw", "tasks", "TASKS.json");
         if (!existsSync(tasksFile)) return "Error: No tasks file. Create tasks first.";
@@ -3093,7 +3864,7 @@ Feature: ${task.featureId} | Type: ${task.type} | Priority: ${task.priority} | S
           task.updatedAt = now;
         } else if (action === "assign") {
           task.assignee = args.assignTo;
-          task.status = "pending"; // 派工 = pending（等人/agent處理）
+          task.status = "pending"; // 派工 = pending(等人/agent處理)
           if (!task.notes) task.notes = [];
           task.notes.push({ by: "agent", at: now, content: `Assigned to ${args.assignTo}` });
           task.updatedAt = now;
@@ -3132,7 +3903,7 @@ Feature: ${task.featureId} | Type: ${task.type} | Priority: ${task.priority} | S
       }
 
       case "auto_dispatch": {
-        // task-driven 自動派工（preview/start/stop）— handler 在 tools/index.mjs，一律走 API
+        // task-driven 自動派工(preview/start/stop)- handler 在 tools/index.mjs,一律走 API
         const { getHandlers: getH3 } = await import("../tools/index.mjs");
         const handlers3 = await getH3();
         if (handlers3.auto_dispatch) {
@@ -3172,7 +3943,7 @@ const MIN_PROMPT_BUDGET_RATIO = 0.5;
 const TOOL_RESULT_CONTEXT_SHARE = 0.3;
 
 // estimateTokens is now imported from context-truncation.mjs (shared)
-// (previously a local function — removed to avoid duplication)
+// (previously a local function - removed to avoid duplication)
 
 /**
  * Trim messages to fit context window.
@@ -3183,7 +3954,7 @@ const TOOL_RESULT_CONTEXT_SHARE = 0.3;
  *   4. Cap any single tool result at 30% of context window
  */
 /**
- * Enhanced trimMessagesToFit — now uses shared context-truncation.mjs
+ * Enhanced trimMessagesToFit - now uses shared context-truncation.mjs
  *
  * Pipeline: smart tool result truncation (head+tail) → history limiting → token budget check
  * Auto-compaction (LLM summarization) is handled separately in the agent loop.
@@ -3205,7 +3976,7 @@ export function trimMessagesToFit(messages, contextWindow = DEFAULT_CONTEXT_WIND
     return afterHistoryLimit;
   }
 
-  // Pass 4: Sliding window — keep head + as many tail messages as fit
+  // Pass 4: Sliding window - keep head + as many tail messages as fit
   const head = afterHistoryLimit.slice(0, 2); // system + first user
   const tailMessages = afterHistoryLimit.slice(2);
 
@@ -3237,7 +4008,7 @@ export function trimMessagesToFit(messages, contextWindow = DEFAULT_CONTEXT_WIND
 
   const summaryMsg = {
     role: "system",
-    content: `[Context trimmed — ${evicted.length} earlier messages summarized]\n${summaryParts.join("\n").slice(0, 3000)}\n[End of summary — ${evicted.length} messages evicted to fit context window]`,
+    content: `[Context trimmed - ${evicted.length} earlier messages summarized]\n${summaryParts.join("\n").slice(0, 3000)}\n[End of summary - ${evicted.length} messages evicted to fit context window]`,
   };
 
   const trimmed = [...head, summaryMsg, ...keptTail];
@@ -3250,8 +4021,8 @@ export function trimMessagesToFit(messages, contextWindow = DEFAULT_CONTEXT_WIND
 
 export async function callLLM(apiUrl, headers, model, messages, tools, stream = false, onEvent = null, agentId = null, maxTokens = 16384, signal = null) {
   console.log(`[callLLM] model=${model}, stream=${stream}, apiUrl=${apiUrl}, messages=${messages.length}, max_tokens=${maxTokens}`);
-  // Vision 保護（2026-08-30 Phase 1）：非 vision model 收到含圖歷史 → 圖換佔位文字（防 API 400）
-  // 所有 agent surface 的 LLM 請求都走這裡 — 一處攔截全鏈生效
+  // Vision 保護(2026-08-30 Phase 1):非 vision model 收到含圖歷史 → 圖換佔位文字(防 API 400)
+  // 所有 agent surface 的 LLM 請求都走這裡 - 一處攔截全鏈生效
   messages = messagesForModel(messages, isVisionModel(model));
   const body = {
     model,
@@ -3291,7 +4062,7 @@ export async function callLLM(apiUrl, headers, model, messages, tools, stream = 
         apiUrl: apiUrl.replace(/\/v.*$/, "/..."), // don't log full URL with keys
         messageCount: body.messages?.length,
         messagesPreview: body.messages?.map(_previewMsg),
-        images: _imgTotal > 0 ? _imgTotal : undefined, // Vision Phase 4：圖片成本歸因（不記 base64）
+        images: _imgTotal > 0 ? _imgTotal : undefined, // Vision Phase 4:圖片成本歸因(不記 base64)
         toolsCount: body.tools?.length || 0,
         toolNames: (body.tools || []).map(t => t.function?.name).filter(Boolean),
         maxTokens: body.max_tokens,
@@ -3332,12 +4103,12 @@ export async function callLLM(apiUrl, headers, model, messages, tools, stream = 
   };
 
   if (stream) {
-    // 串流模式：用 fetchStreamWithRetry 取得連線，回傳 raw response
+    // 串流模式:用 fetchStreamWithRetry 取得連線,回傳 raw response
     const { fetchStreamWithRetry } = await import("./llm-utils.mjs");
     const resp = await fetchStreamWithRetry(apiUrl, {
       method: "POST",
       headers,
-      body: JSON.stringify(body),
+      body: jsonStringifySafe(body), // 2026-09-14: 孤兒 surrogate 清毒(emoji 截斷殘骸 → LLM 500)
     }, { timeoutMs: LLM_CALL_TIMEOUT_MS, readTimeoutMs: 600_000, maxRetries: 2, signal, onRetry: (info) => {
       if (onEvent) onEvent("info", { message: `⏳ API 暫時不可用 (HTTP ${info.status}), ${info.delayMs / 1000}s 後重試...` });
     } });
@@ -3347,14 +4118,14 @@ export async function callLLM(apiUrl, headers, model, messages, tools, stream = 
       _logStreamResponse(null, `HTTP ${resp.status}: ${text.slice(0, 200)}`);
       throw new Error(`LLM API error ${resp.status}: ${text.slice(0, 500)}`);
     }
-    // Stream response — log metadata later in runAgentLoopStream
+    // Stream response - log metadata later in runAgentLoopStream
     // Attach callId so the loop can log the response
     resp._llmCallId = callId;
     resp._llmCallStart = callStartTime;
     return resp; // Return raw response for SSE streaming
   }
 
-  // 非串流：用 callLLMWithRetry 統一處理 retry + 內容驗證
+  // 非串流:用 callLLMWithRetry 統一處理 retry + 內容驗證
   const result = await callLLMWithRetry(apiUrl, headers, body, {
     maxRetries: 3,
     timeoutMs: LLM_CALL_TIMEOUT_MS,
@@ -3368,24 +4139,24 @@ export async function callLLM(apiUrl, headers, model, messages, tools, stream = 
     },
   });
 
-  // callLLMWithRetry handles its own logging — no duplicate _logResponse here
-  // 回傳跟原本一樣的 shape（把 result.raw 當 json 回傳）
+  // callLLMWithRetry handles its own logging - no duplicate _logResponse here
+  // 回傳跟原本一樣的 shape(把 result.raw 當 json 回傳)
   return result.raw;
 }
 
 // ── System Prompt Assembly ──
 
-/** Skill bindings — 把 project crew 綁定的技能整份展開，直接附加到 system prompt送 LLM
- *  綁定存在 {cwd}/.paaw/agents/_config.json 的 skillBindings（Management 頁可設）
- *  auto-dispatch / crew chat / cron 都走這裡，一處注入全部生效 */
+/** Skill bindings - 把 project crew 綁定的技能整份展開,直接附加到 system prompt送 LLM
+ *  綁定存在 {cwd}/.paaw/agents/_config.json 的 skillBindings(Management 頁可設)
+ *  auto-dispatch / crew chat / cron 都走這裡,一處注入全部生效 */
 export async function appendSkillBindings(systemPrompt, cwd, agentId) {
   if (!agentId || !cwd) return systemPrompt;
   try {
     const { readProjectSkills } = await import("./project-crew.mjs");
     const bound = readProjectSkills(cwd, agentId);
     if (!bound || bound.length === 0) return systemPrompt;
-    const section = bound.map(s => `### Skill: ${s.name}${s.path ? `\n（源路徑: ${s.path}）` : ""}\n${s.prompt}`).join("\n\n");
-    return systemPrompt + `\n\n## 已掛載技能 (Skills)\n以下是綁定到此 Agent 的技能定義，請在執行任務時遵循這些規則（skill 定義優先於一般做法）：\n\n${section}`;
+    const section = bound.map(s => `### Skill: ${s.name}${s.path ? `\n(源路徑: ${s.path})` : ""}\n${s.prompt}`).join("\n\n");
+    return systemPrompt + `\n\n## 已掛載技能 (Skills)\n以下是綁定到此 Agent 的技能定義,請在執行任務時遵循這些規則(skill 定義優先於一般做法):\n\n${section}`;
   } catch (err) {
     console.warn("[AgentLoop] Skill binding injection failed:", err.message);
     return systemPrompt;
@@ -3416,7 +4187,7 @@ function refreshDynamicContext(messages) {
 function buildSystemPrompt({ cwd, skillMd, customPrompt, params, paawContext }) {
   const parts = [];
 
-  // ── 當前日期時間 + 時區（2026-09-06 Fleming：agent 預設要知道今天幾號、什麼時區）──
+  // ── 當前日期時間 + 時區(2026-09-06 Fleming:agent 預設要知道今天幾號、什麼時區)──
   {
     const _now = new Date();
     const _tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
@@ -3425,7 +4196,7 @@ function buildSystemPrompt({ cwd, skillMd, customPrompt, params, paawContext }) 
     const _dateStr = `${_now.getFullYear()}-${String(_now.getMonth() + 1).padStart(2, "0")}-${String(_now.getDate()).padStart(2, "0")}`;
     const _weekday = ["日", "一", "二", "三", "四", "五", "六"][_now.getDay()];
     const _timeStr = `${String(_now.getHours()).padStart(2, "0")}:${String(_now.getMinutes()).padStart(2, "0")}`;
-    parts.push(`=== 當前日期時間 ===\n今天是 ${_dateStr}（星期${_weekday}），時間 ${_timeStr}，時區 ${_tz} (${_offStr})`);
+    parts.push(`=== 當前日期時間 ===\n今天是 ${_dateStr}(星期${_weekday}),時間 ${_timeStr},時區 ${_tz} (${_offStr})`);
   }
 
   // ── Inject .paaw/ project context (pre-loaded by caller) ──
@@ -3434,7 +4205,7 @@ function buildSystemPrompt({ cwd, skillMd, customPrompt, params, paawContext }) 
   }
 
   // If customPrompt is provided, it replaces the default agent prompt entirely
-  // (customPrompt comes from contextEngine — e.g. skill-builder rules)
+  // (customPrompt comes from contextEngine - e.g. skill-builder rules)
   if (customPrompt) {
     parts.push(customPrompt);
   } else {
@@ -3457,35 +4228,35 @@ function buildSystemPrompt({ cwd, skillMd, customPrompt, params, paawContext }) 
     // 1. Knowledge: just the directory path, don't expand contents
     const knowledgeDir = resolve(PAAW_R, "data/knowledge");
     if (existsSync(knowledgeDir)) {
-      refPaths.push(`📖 Knowledge (data/knowledge/) — 使用 reference_read(action="list|read|search", source="knowledge") 存取（唯讀）`);
+      refPaths.push(`📖 Knowledge (data/knowledge/) - 使用 reference_read(action="list|read|search", source="knowledge") 存取(唯讀)`);
     }
 
     // 2. Workspace: external dirs from workspaces.json (just the paths)
     try {
       const ws = JSON.parse(readSync(resolve(PAAW_R, "data/workspaces.json"), "utf-8"));
       if (ws.directories?.length) {
-        refPaths.push(`📂 Workspace 目錄（使用 reference_read(action="list|read|search", source="workspace", path="...") 存取）：\n${ws.directories.map(d => "  - " + d).join("\n")}`);
+        refPaths.push(`📂 Workspace 目錄(使用 reference_read(action="list|read|search", source="workspace", path="...") 存取):\n${ws.directories.map(d => "  - " + d).join("\n")}`);
       }
     } catch {}
 
     if (refPaths.length > 0) {
-      parts.push(`\n=== 參考資料路徑 ===\n${refPaths.join("\n\n")}\n\n使用 reference_read tool 瀏覽和搜尋以上資料。開發相似功能時，先用 reference_read(action="search", source="knowledge", path="關鍵字") 搜尋現有範例。`);
+      parts.push(`\n=== 參考資料路徑 ===\n${refPaths.join("\n\n")}\n\n使用 reference_read tool 瀏覽和搜尋以上資料。開發相似功能時,先用 reference_read(action="search", source="knowledge", path="關鍵字") 搜尋現有範例。`);
     }
   } catch {}
 
   // Inject cwd dynamically
   parts.push(`\nWorking directory: ${cwd}`);
 
-  // Release Unit Boundary（RU = 專案目錄；FileGuard 已在路徑層強制，此處是明示）
+  // Release Unit Boundary(RU = 專案目錄;FileGuard 已在路徑層強制,此處是明示)
   const _ruName = (cwd.replace(/\\/g, "/").split("/").filter(Boolean).pop() || "workspace");
-  parts.push(`\n## Release Unit Boundary\n你目前服務的 Release Unit：${_ruName}\n檔案讀寫已被路徑邊界強制限制在此專案目錄內（deterministic enforcement，非提醒）。其他 Release Unit（其他專案目錄）的檔案不可存取也不需存取。若使用者要求的內容需要其他 Release Unit，請說明邊界並請使用者切換到該 RU 操作。`);
+  parts.push(`\n## Release Unit Boundary\n你目前服務的 Release Unit:${_ruName}\n檔案讀寫已被路徑邊界強制限制在此專案目錄內(deterministic enforcement,非提醒)。其他 Release Unit(其他專案目錄)的檔案不可存取也不需存取。若使用者要求的內容需要其他 Release Unit,請說明邊界並請使用者切換到該 RU 操作。`);
   if (IS_WIN) {
-    parts.push(`\n⚠️ Windows 環境重要規則：\n- 寫檔案請用 write_file/edit_file 工具，不要用 bash 的 echo/cat 重定向（cmd.exe 字元轉義會出問題）\n- **禁止用 bash 跑 Unix 指令**：find、grep、ls、cat、head、tail、wc、sed、awk、xargs、rm、cp、mv、mkdir、touch 等在 Windows cmd.exe 不可用或行為不同\n- 用內建工具代替：glob 找檔案、grep 工具搜尋內容、read_file 讀檔、write_file 寫檔\n- bash 只用於：git 命令、node/npm/npx 命令、python 命令、跨平台指令\n- 路徑一律用正斜線 / 不要用反斜線 \\\n- 檔案路徑一律用相對路徑（如 data/apps/report/app.html），不要用絕對路徑（如 C:\\Users\\...）\n- git 命令可以正常使用\n- **每個 tool 呼叫都有 30 秒 timeout**，如果操作需要更久請分步驟執行`);
+    parts.push(`\n⚠️ Windows 環境重要規則:\n- 寫檔案請用 write_file/edit_file 工具,不要用 bash 的 echo/cat 重定向(cmd.exe 字元轉義會出問題)\n- **禁止用 bash 跑 Unix 指令**:find、grep、ls、cat、head、tail、wc、sed、awk、xargs、rm、cp、mv、mkdir、touch 等在 Windows cmd.exe 不可用或行為不同\n- 用內建工具代替:glob 找檔案、grep 工具搜尋內容、read_file 讀檔、write_file 寫檔\n- bash 只用於:git 命令、node/npm/npx 命令、python 命令、跨平台指令\n- 路徑一律用正斜線 / 不要用反斜線 \\\n- 檔案路徑一律用相對路徑(如 data/apps/report/app.html),不要用絕對路徑(如 C:\\Users\\...)\n- git 命令可以正常使用\n- **每個 tool 呼叫都有 30 秒 timeout**,如果操作需要更久請分步驟執行`);
   }
 
-  // Tool overview (compact — full schemas are sent via function-calling format)
-  parts.push(`\n## Tools Overview\nproject_info(cat=...) → context/features/feature_detail/runbook/test_map/recent_changes/issues/api_history/project_read\nproject_edit(action=...) → issue_create/update/delete, change_record, feature_update_docs/mapping/delete\nread_file, write_file, edit_file, glob, grep, diff, git, bash, ask_user\nreference_read(action=list|read|search, source=workspace|knowledge) → browse/read/search reference files in workspace/ and knowledge/ (read-only, for finding existing code examples and docs)\ntask_list(id?, status?, pipelinePhase?, type?, priority?) → list tasks or get single task\ntask_create(title, type, description?, fileScope?, acceptanceCriteria?, source?) → create new task with pipeline\ntask_update(id, action=update|advance|reject|note|assign, ...) → update task, advance/reject pipeline phase, add notes\ntask_decompose(parentId, subTasks) → split a large task into sub-tasks
-task_retrofit(priority?, featureIds?) → 上線前品質補強：從 feature map 每個 active feature 建一個補 review/test/qa/docs 的全版 task（以代碼現況為準，非歷史 task）\ndispatch_agent(agentId, task, taskId?) → dispatch work to another agent (architect/developer/tester/doc-writer/qa/helpdesk)\ncu_refresh, record_decision, docs(action=...), action_log_add/list, agent_memory_save/load`);
+  // Tool overview (compact - full schemas are sent via function-calling format)
+  parts.push(`\n## Tools Overview\nproject_info(cat=...) → context/features/feature_detail/runbook/test_map/recent_changes/issues/api_history/project_read\nproject_edit(action=...) → issue_create/update/delete, change_record, feature_update_docs/mapping/delete\nread_file, write_file, edit_file, glob, grep, diff, git, bash, ask_user\n🧹 暫存規則(鐵律):測試/驗證/debug 用的暫存腳本一律寫 $PAAW_TMP/ 目錄(env 已注入,session 結束自動清)- 不要寫專案根目錄;寫進專案的 test-*.mjs / debug-* / tmp-* / scratch-* 等 session 結束會被自動刪\nreference_read(action=list|read|search, source=workspace|knowledge) → browse/read/search reference files in workspace/ and knowledge/ (read-only, for finding existing code examples and docs)\ntask_list(id?, status?, type?, featureId?, priority?) → list tasks or get single task\ntask_create(title, type, description?, fileScope?, acceptanceCriteria?, source?) → create new task(feature-first,無 pipeline)\ntask_update(id, action=update|note|assign, ...) → 改 task 欄位/狀態、加 note、派工\ntask_decompose(parentId, subTasks) → split a large task into sub-tasks
+task_retrofit(priority?, featureIds?) → 上線前品質補強:從 feature map 每個 active feature 建一個補 review/test/qa/docs 的全版 task(以代碼現況為準,非歷史 task)\ndispatch_agent(agentId, task, taskId?) → dispatch work to another agent (architect/developer/tester/doc-writer/qa/helpdesk)\ncu_refresh, record_decision, docs(action=...), action_log_add/list, agent_memory_save/load`);
 
   if (skillMd) {
     parts.push(`\n## Skill Instructions\n\n${skillMd}`);
@@ -3504,20 +4275,20 @@ task_retrofit(priority?, featureIds?) → 上線前品質補強：從 feature ma
  * Clean up temporary/scratch files created by the agent during a session.
  *
  * Strategy:
- * 1. Files in log/tmp/<ru-slug>/（$PAAW_TMP）— always cleaned (designated temp area)
- * 2. Created files matching temp patterns — cleaned (test-*.mjs, scratch.*, _temp.*, etc.)
- * 3. Created files that are legitimate source — kept (reported only)
+ * 1. Files in log/tmp/<ru-slug>/($PAAW_TMP)- always cleaned (designated temp area)
+ * 2. Created files matching temp patterns - cleaned (test-*.mjs, scratch.*, _temp.*, etc.)
+ * 3. Created files that are legitimate source - kept (reported only)
  *
  * @param {string} cwd - project working directory
  * @param {Set<string>} createdFiles - files tracked as newly created
  * @param {Function} [logFn] - optional logger
  * @returns {Promise<number>} number of files cleaned
  */
-async function cleanupTempFiles(cwd, createdFiles, logFn) {
+async function cleanupTempFiles(cwd, createdFiles, logFn, sinceMs) {
   const LOG = logFn || (() => {});
   let cleaned = 0;
 
-  // 1. Always clean log/tmp/<ru-slug>/（$PAAW_TMP — 2026-09-06 起 scratch 不再進 .paaw）
+  // 1. Always clean log/tmp/<ru-slug>/($PAAW_TMP - 2026-09-06 起 scratch 不再進 .paaw)
   const tmpDir = join(LOG_HOME, "tmp", logSlug(cwd));
   try {
     const tmpFiles = await readdir(tmpDir).catch(() => []);
@@ -3576,6 +4347,15 @@ async function cleanupTempFiles(cwd, createdFiles, logFn) {
     }
   }
 
+  // 3. 專案掃描(2026-09-19):bash 創的檔不走 write_file → createdFiles 追蹤不到;
+  //    git untracked + 暫存 pattern + mtime 在 session 窗內 → 刪(temp-janitor.mjs)
+  try {
+    const report = cleanupProjectTempFiles(cwd, sinceMs || (Date.now() - 30 * 60 * 1000), LOG);
+    cleaned += report.removed.length;
+  } catch (e) {
+    LOG(`[cleanup] project scan failed: ${e.message}`);
+  }
+
   if (cleaned > 0) {
     LOG(`[cleanup] Session cleanup: removed ${cleaned} temp file(s)`);
   }
@@ -3610,8 +4390,8 @@ export async function runAgentLoop(config) {
     onEvent = null,
     rootDir = _PAAW_ROOT,
     agentId = null,
-    abortSignal = null, // 使用者中斷 — 傳進 callLLM，即時殺 in-flight LLM 呼叫
-    featureBoundary = null, // Context Boundary — { allowedFiles: string[], featureIds: string[] }
+    abortSignal = null, // 使用者中斷 - 傳進 callLLM,即時殺 in-flight LLM 呼叫
+    featureBoundary = null, // Context Boundary - { allowedFiles: string[], featureIds: string[] }
   } = config;
 
   // Load agent config for defaults (with fallback)
@@ -3628,7 +4408,7 @@ export async function runAgentLoop(config) {
   const timeoutMs = effectiveTimeout > 0 ? effectiveTimeout * 1000 : 0; // 0 = no timeout
   const toolCallLog = [];
 
-  // 2026-09-05 Fleming：每個 agent loop 的開始/結束要在 console 一眼看到
+  // 2026-09-05 Fleming:每個 agent loop 的開始/結束要在 console 一眼看到
   console.log(`[AgentLoop] ▶️ agent=${agentId || "agent"} model=${modelOverride || "default"} turns≤${effectiveMaxTurns} cwd=${String(cwd).split("/").slice(-2).join("/")} prompt=${prompt.length}字`);
 
   // ── Execution logger ──
@@ -3644,8 +4424,8 @@ export async function runAgentLoop(config) {
   const createdFiles = new Set(); // track NEW files (didn't exist before) for cleanup
 
   // Ensure $PAAW_TMP exists as designated temp area (auto-cleaned each session)
-  // log/tmp/<ru-slug>/（2026-09-06 Fleming：.paaw 只放資產 — scratch 一律中央 log/）
-  // bash tool 已注入 $PAAW_TMP env；agents 寫 scratch 走這裡，不再碰 .paaw
+  // log/tmp/<ru-slug>/(2026-09-06 Fleming:.paaw 只放資產 - scratch 一律中央 log/)
+  // bash tool 已注入 $PAAW_TMP env;agents 寫 scratch 走這裡,不再碰 .paaw
   const tmpDir = join(LOG_HOME, "tmp", logSlug(cwd));
   try {
     await mkdir(tmpDir, { recursive: true });
@@ -3657,7 +4437,7 @@ export async function runAgentLoop(config) {
     LOG(`[cleanup] log/tmp cleared ${oldTempFiles.length} leftover temp files`);
   } catch {}
 
-  // Resolve LLM config — mutable: fallback success updates active model for subsequent turns
+  // Resolve LLM config - mutable: fallback success updates active model for subsequent turns
   let llm = resolveLLMConfig(rootDir, modelOverride, fallbackModels);
 
   // ── Check rate-limit cache: skip primary if still throttled ──
@@ -3705,7 +4485,7 @@ export async function runAgentLoop(config) {
     }
     // Check timeout (skip if timeout=0 = no limit)
     if (timeoutMs > 0 && Date.now() - startTime > timeoutMs) {
-      finalContent += `\n\n---\n⏱️ 任務超時 (${effectiveTimeout}s)，但已完成 ${turns} 個步驟。\n已修改的檔案已保存。\n你可以跟我說「繼續」來接著完成。\n---`;
+      finalContent += `\n\n---\n⏱️ 任務超時 (${effectiveTimeout}s),但已完成 ${turns} 個步驟。\n已修改的檔案已保存。\n你可以跟我說「繼續」來接著完成。\n---`;
       // Save progress so we can resume
       try {
         const paaw2 = createPaawProject(cwd);
@@ -3713,7 +4493,7 @@ export async function runAgentLoop(config) {
           await paaw2.addActionLog({
             agent: agentId || "unknown",
             action: "timeout",
-            summary: `任務超時，已完成 ${turns}/${effectiveMaxTurns} 步。已部分完成，可續接。`,
+            summary: `任務超時,已完成 ${turns}/${effectiveMaxTurns} 步。已部分完成,可續接。`,
             result: "partial",
           });
         }
@@ -3742,10 +4522,10 @@ export async function runAgentLoop(config) {
       }
     }
 
-    // Call LLM (with context window trimming — smart head+tail + history limit)
+    // Call LLM (with context window trimming - smart head+tail + history limit)
     const trimmedMessages = trimMessagesToFit(messages, llm.contextWindow || DEFAULT_CONTEXT_WINDOW);
-    // ── Vision 路由（2026-08-30 Phase 3）：歷史含圖 + active model 非 vision + visionModel 可用 → 本輪換 vision model ──
-    // 每輪重算（compaction 收掉圖 → 自動換回原 model）；429 fallback 鏈照舊走原鏈（佔位保護接手）
+    // ── Vision 路由(2026-08-30 Phase 3):歷史含圖 + active model 非 vision + visionModel 可用 → 本輪換 vision model ──
+    // 每輪重算(compaction 收掉圖 → 自動換回原 model);429 fallback 鏈照舊走原鏈(佔位保護接手)
     const turnLlm = resolveVisionLlmConfig(llm, hasImages(messages)) || llm;
     if (turnLlm !== llm) console.log(`[Agent Loop] 👁 vision routing: ${llm.providerId}/${llm.model} → ${turnLlm.providerId}/${turnLlm.model} (history has images)`);
     let response;
@@ -3755,22 +4535,25 @@ export async function runAgentLoop(config) {
         if (onEvent) onEvent({ type: evt, ...data });
       }, agentId, turnLlm.maxTokens, abortSignal);
     } catch (err) {
-      // 使用者中斷 — 不進 fallback，直接結束
+      // 使用者中斷 - 不進 fallback,直接結束
       if (abortSignal?.aborted || err.name === "AbortError") {
         finalContent = "⏹️ Agent 已中斷。";
         break;
       }
-      // ── Provider-level fallback on 429/rate-limit ──
+      // ── Provider-level fallback：429/限流 或 model 層級硬錯 ──
+      // 2026-09-23 fix：model 硬錯（400 unknown model / 401 / 403 / 404）之前不進 fallback 直接整單死 —
+      // EM 派工選到壞 model 時 qa/tester 全滅（公司 gpt5.6 事件）。跟 EM 規劃路徑對齊：任何 model 掛了都試下一個。
       const is429 = err.message && (err.message.includes("429") || err.message.includes("overloaded") || err.message.includes("rate") || err.message.includes("Limit Exhausted"));
-      if (is429 && llm.fallbacks && llm.fallbacks.length > 0) {
+      const isModelReject = err.message && /LLM API error (400|401|403|404)/.test(err.message);
+      if ((is429 || isModelReject) && llm.fallbacks && llm.fallbacks.length > 0) {
         for (const fb of llm.fallbacks) {
-          console.log(`[Agent Loop] 429 rate-limited on ${llm.providerId}/${llm.model}, trying fallback: ${fb.providerId}/${fb.model}`);
-          if (onEvent) onEvent({ type: "info", message: `⏳ ${llm.providerId} 限流，切換到 ${fb.providerId}/${fb.model}` });
+          console.log(`[Agent Loop] ${is429 ? "429 rate-limited" : "model rejected"} on ${llm.providerId}/${llm.model}, trying fallback: ${fb.providerId}/${fb.model}`);
+          if (onEvent) onEvent({ type: "info", message: `${is429 ? "⏳ " + llm.providerId + " 限流" : "⚠️ " + llm.providerId + "/" + llm.model + " 不可用（" + String(err.message).slice(0, 120) + "）"},切換到 ${fb.providerId}/${fb.model}` });
           try {
             response = await callLLM(fb.apiUrl, fb.headers, fb.model, trimmedMessages, toolRegistry.initialized ? toolRegistry.getDefinitions(getToolsForAgent(agentId, [], cwd).map(t => t.function?.name)) : getToolsForAgent(agentId, [], cwd), false, (evt, data) => {
               if (onEvent) onEvent({ type: evt, ...data });
             }, agentId, fb.maxTokens || llm.maxTokens, abortSignal);
-            console.log(`[Agent Loop] Fallback to ${fb.providerId}/${fb.model} succeeded — switching active model for subsequent turns`);
+            console.log(`[Agent Loop] Fallback to ${fb.providerId}/${fb.model} succeeded - switching active model for subsequent turns`);
             // Cache rate-limit: remember primary is throttled
             _rateLimitCache.set(primaryKey, { until: Date.now() + RATE_LIMIT_COOLDOWN_MS, fallbackKey: _providerKey(fb.providerId, fb.model) });
             // Update active LLM config so next loop iteration uses the fallback model directly
@@ -3782,7 +4565,7 @@ export async function runAgentLoop(config) {
           }
         }
         if (!response) {
-          finalContent = `LLM API error: All providers failed (429 rate-limited). ${err.message}`;
+          finalContent = `LLM API error: All providers failed (${is429 ? "429 rate-limited" : "model rejected"}). ${err.message}`;
           if (onEvent) onEvent({ type: "error", error: finalContent });
           break;
         }
@@ -3809,36 +4592,36 @@ export async function runAgentLoop(config) {
       _totalUsage.completion += response.usage.completion_tokens || 0;
       _totalUsage.total += response.usage.total_tokens || 0;
     }
-    // sanitize content（清隱藏字元）
+    // sanitize content(清隱藏字元)
     let content = sanitizeContent(assistantMsg.content || "");
     const toolCalls = assistantMsg.tool_calls;
 
     // Add assistant message to history
     const historyMsg = { role: "assistant", content };
     if (toolCalls) historyMsg.tool_calls = toolCalls;
-    // 思考連續性（2026-08-30）：reasoning_content 帶回下一輪 — 多步 tool loop 不每輪失憶重推
-    // - 只在「本輪有 tool call」時帶（純文字回應後 loop 結束，帶了沒人讀）
-    // - 截斷防膨脹：保結尾 4096 字（結論在尾端）
+    // 思考連續性(2026-08-30):reasoning_content 帶回下一輪 - 多步 tool loop 不每輪失憶重推
+    // - 只在「本輪有 tool call」時帶(純文字回應後 loop 結束,帶了沒人讀)
+    // - 截斷防膨脹:保結尾 4096 字(結論在尾端)
     const _reasoning = assistantMsg.reasoning_content;
     if (toolCalls && toolCalls.length > 0 && _reasoning && _reasoning.trim()) {
-      historyMsg.reasoning_content = _reasoning.length > 4096 ? "…(前略)… " + _reasoning.slice(-4096) : _reasoning;
+      historyMsg.reasoning_content = _reasoning.length > 4096 ? "...(前略)... " + _reasoning.slice(-4096) : _reasoning;
     }
     messages.push(historyMsg);
 
     // If LLM just responded with text (no tool calls), we're done
     if (!toolCalls || toolCalls.length === 0 || choice.finish_reason === "stop") {
-      // 防禦：如果 content 是空的或只有隱藏字元，重試一次
+      // 防禦:如果 content 是空的或只有隱藏字元,重試一次
       if (!isMeaningfulContent(content)) {
         if (emptyRetryCount < 1) {
           emptyRetryCount++;
           console.warn(`[Agent Loop] LLM returned empty/whitespace response, retrying... (attempt ${emptyRetryCount})`);
-          if (onEvent) onEvent({ type: "info", message: "⚠️ AI 回應為空，重新呼叫中..." });
+          if (onEvent) onEvent({ type: "info", message: "⚠️ AI 回應為空,重新呼叫中..." });
           // 移除剛加的 assistant message
           messages.pop();
           i--; // retry same turn
           continue;
         }
-        finalContent = "[LLM 回應為空或僅含隱藏字元，重試後仍失敗]";
+        finalContent = "[LLM 回應為空或僅含隱藏字元,重試後仍失敗]";
         if (onEvent) onEvent({ type: "assistant", content: finalContent });
       } else {
         finalContent = content;
@@ -3911,9 +4694,9 @@ export async function runAgentLoop(config) {
         args: call.function.arguments,
         result: toolResult.slice(0, 1000),
       });
-      // ── Vision Phase 3（2026-08-30）：tool result 帶 [[PAAW_IMAGE:...]] → 圖進 agent message ──
-      // 有看圖能力（active model 是 vision 或 visionModel 可路由）→ tool 訊息帶乾淨文字 + 追加圖片訊息
-      // 沒有 → 標記降級為「已存檔」文字提示（呼叫 callLLM 時佔位保護也接不到圖，不白附 base64）
+      // ── Vision Phase 3(2026-08-30):tool result 帶 [[PAAW_IMAGE:...]] → 圖進 agent message ──
+      // 有看圖能力(active model 是 vision 或 visionModel 可路由)→ tool 訊息帶乾淨文字 + 追加圖片訊息
+      // 沒有 → 標記降級為「已存檔」文字提示(呼叫 callLLM 時佔位保護也接不到圖,不白附 base64)
       let _pushToolMsg = toolResult;
       let _imageMsg = null;
       const { text: _cleanText, imagePaths: _imgPaths } = extractImageMarkers(toolResult);
@@ -3922,11 +4705,11 @@ export async function runAgentLoop(config) {
           _pushToolMsg = _cleanText;
           _imageMsg = buildImageAttachmentMessage(
             _imgPaths,
-            "📸 [系統附圖] 這是 browser_screenshot 拍的目前畫面（系統自動附上，非使用者輸入）— 請基於畫面內容做視覺驗證"
+            "📸 [系統附圖] 這是 browser_screenshot 拍的目前畫面(系統自動附上,非使用者輸入)- 請基於畫面內容做視覺驗證"
           );
           console.log(`[Agent Loop] 👁 vision attach: ${_imgPaths.length} image(s) from ${_toolName}`);
         } else {
-          _pushToolMsg = _cleanText + "\n（圖片已存檔但本 run 無 vision 能力 — 請改用 browser_read 讀取文字內容）";
+          _pushToolMsg = _cleanText + "\n(圖片已存檔但本 run 無 vision 能力 - 請改用 browser_read 讀取文字內容)";
         }
       }
       messages.push({
@@ -4019,7 +4802,7 @@ export async function runAgentLoop(config) {
                   }
                 }
               } else {
-                LOG("[post-edit-verify] No affected tests found — skipping auto-verify");
+                LOG("[post-edit-verify] No affected tests found - skipping auto-verify");
               }
             }
           } catch (verifyErr) {
@@ -4033,10 +4816,10 @@ export async function runAgentLoop(config) {
   }
 
   // ── Auto-cleanup temp files created during this session ──
-  await cleanupTempFiles(cwd, createdFiles, (msg) => console.log(msg));
+  await cleanupTempFiles(cwd, createdFiles, (msg) => console.log(msg), startTime);
 
   const _loopOk = !finalContent.includes("[Agent loop timed out]") && !finalContent.startsWith("LLM API error");
-  console.log(`[AgentLoop] ${_loopOk ? "✅" : "❌"} agent=${agentId || "agent"} 結束（${turns} turns, ${((Date.now() - startTime) / 1000).toFixed(0)}s, ${_totalUsage.total || 0} tokens, 輸出 ${finalContent.length} 字）`);
+  console.log(`[AgentLoop] ${_loopOk ? "✅" : "❌"} agent=${agentId || "agent"} 結束(${turns} turns, ${((Date.now() - startTime) / 1000).toFixed(0)}s, ${_totalUsage.total || 0} tokens, 輸出 ${finalContent.length} 字)`);
 
   return {
     success: _loopOk,
@@ -4069,6 +4852,8 @@ export async function runAgentLoopStream(config, res) {
     agentId = null,
     abortSignal = null,
     featureBoundary = null,
+    // 2026-09-11 治本:事件側車 - 不管 res 生死都回報(a2a stream-state 靠這個在 client 斷線後繼續 buffer)
+    onStreamEvent = null,
   } = config;
 
   let agentCfg = { ..._agentCfgDefaults };
@@ -4086,7 +4871,7 @@ export async function runAgentLoopStream(config, res) {
   const streamCreatedFiles = new Set(); // track NEW files for cleanup
 
   // Ensure $PAAW_TMP exists as designated temp area (auto-cleaned each session)
-  // log/tmp/<ru-slug>/（2026-09-06：.paaw 只放資產）— 同 runAgentLoop
+  // log/tmp/<ru-slug>/(2026-09-06:.paaw 只放資產)- 同 runAgentLoop
   const streamTmpDir = join(LOG_HOME, "tmp", logSlug(cwd));
   try {
     await mkdir(streamTmpDir, { recursive: true });
@@ -4108,6 +4893,7 @@ export async function runAgentLoopStream(config, res) {
 
   // SSE helper
   const sendSSE = (event, data) => {
+    try { if (onStreamEvent) onStreamEvent(event, data); } catch {} // 側車先送 - res.destroyed 後 finalContent 靠它落地
     try {
       if (res.writableEnded || res.destroyed) return;
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -4115,7 +4901,7 @@ export async function runAgentLoopStream(config, res) {
   };
 
   // Resolve LLM config
-  // Resolve LLM config — mutable for fallback
+  // Resolve LLM config - mutable for fallback
   let llm = resolveLLMConfig(rootDir, modelOverride, fallbackModels);
 
   // ── Check rate-limit cache: skip primary if still throttled ──
@@ -4159,7 +4945,7 @@ export async function runAgentLoopStream(config, res) {
       break;
     }
     if (timeoutMs > 0 && Date.now() - startTime > timeoutMs) {
-      sendSSE("error", { error: `Agent loop timed out after ${Math.round(timeoutMs/60000)} min (${turns} turns completed). Work may be partially done — moving to next sub-task. Check action log for what was completed.` });
+      sendSSE("error", { error: `Agent loop timed out after ${Math.round(timeoutMs/60000)} min (${turns} turns completed). Work may be partially done - moving to next sub-task. Check action log for what was completed.` });
       break;
     }
 
@@ -4186,25 +4972,27 @@ export async function runAgentLoopStream(config, res) {
     const trimmedMessages = trimMessagesToFit(messages, llm.contextWindow || DEFAULT_CONTEXT_WINDOW);
     let response;
     let usedLlm = llm;
-    // ── Vision 路由（2026-08-30 Phase 3）：同 runAgentLoop — 歷史含圖 → 本輪換 vision model ──
+    // ── Vision 路由(2026-08-30 Phase 3):同 runAgentLoop - 歷史含圖 → 本輪換 vision model ──
     usedLlm = resolveVisionLlmConfig(llm, hasImages(messages)) || llm;
     if (usedLlm !== llm) console.log(`[Agent Loop Stream] 👁 vision routing: ${llm.providerId}/${llm.model} → ${usedLlm.providerId}/${usedLlm.model} (history has images)`);
     const _llmLog = _logger.llmCall({ turn: turns, model: usedLlm.model, messageCount: trimmedMessages.length, contextTokens: estimateMessageTokens(trimmedMessages) });
     try {
       response = await callLLM(usedLlm.apiUrl, usedLlm.headers, usedLlm.model, trimmedMessages, toolRegistry.initialized ? toolRegistry.getDefinitions(getToolsForAgent(agentId, [], cwd).map(t => t.function?.name)) : getToolsForAgent(agentId, [], cwd), false, sendSSE, agentId, usedLlm.maxTokens, abortSignal);
     } catch (err) {
-      // 使用者中斷 — 殺掉 in-flight LLM 呼叫後立即停止，不進 fallback/retry
+      // 使用者中斷 - 殺掉 in-flight LLM 呼叫後立即停止,不進 fallback/retry
       if (abortSignal?.aborted || err.name === "AbortError") {
         sendSSE("interrupted", { message: "Agent interrupted by user", turns });
         break;
       }
+      // 2026-09-23 fix：同 runAgentLoop — model 硬錯（400/401/403/404）也要走 fallback，不再只限 429
       const is429 = err.message && (err.message.includes("429") || err.message.includes("overloaded") || err.message.includes("rate"));
-      if (is429 && llm.fallbacks && llm.fallbacks.length > 0) {
+      const isModelReject = err.message && /LLM API error (400|401|403|404)/.test(err.message);
+      if ((is429 || isModelReject) && llm.fallbacks && llm.fallbacks.length > 0) {
         for (const fb of llm.fallbacks) {
-          console.log(`[callLLM] 429 rate-limited, trying fallback: ${fb.providerId}/${fb.model}`);
+          console.log(`[callLLM] ${is429 ? "429 rate-limited" : "model rejected"}, trying fallback: ${fb.providerId}/${fb.model}`);
             // Cache rate-limit: remember primary is throttled
             _rateLimitCache.set(primaryKey, { until: Date.now() + RATE_LIMIT_COOLDOWN_MS, fallbackKey: _providerKey(fb.providerId, fb.model) });
-            sendSSE("info", { message: `⏳ ${llm.providerId} 限流，切換到 ${fb.providerId}/${fb.model}` });
+            sendSSE("info", { message: `${is429 ? "⏳ " + llm.providerId + " 限流" : "⚠️ " + llm.providerId + "/" + llm.model + " 不可用"},切換到 ${fb.providerId}/${fb.model}` });
             try {
               response = await callLLM(fb.apiUrl, fb.headers, fb.model, trimmedMessages, toolRegistry.initialized ? toolRegistry.getDefinitions(getToolsForAgent(agentId, [], cwd).map(t => t.function?.name)) : getToolsForAgent(agentId, [], cwd), false, sendSSE, agentId, fb.maxTokens || llm.maxTokens, abortSignal);
               usedLlm = fb;
@@ -4268,25 +5056,25 @@ export async function runAgentLoopStream(config, res) {
 
     const historyMsg = { role: "assistant", content };
     if (toolCalls) historyMsg.tool_calls = toolCalls;
-    // 思考連續性（2026-08-30）：同 runAgentLoop — reasoning_content 只在 tool 輪帶回、截尾 4096
+    // 思考連續性(2026-08-30):同 runAgentLoop - reasoning_content 只在 tool 輪帶回、截尾 4096
     const _reasoning = assistantMsg.reasoning_content;
     if (toolCalls && toolCalls.length > 0 && _reasoning && _reasoning.trim()) {
-      historyMsg.reasoning_content = _reasoning.length > 4096 ? "…(前略)… " + _reasoning.slice(-4096) : _reasoning;
+      historyMsg.reasoning_content = _reasoning.length > 4096 ? "...(前略)... " + _reasoning.slice(-4096) : _reasoning;
     }
     messages.push(historyMsg);
 
-    // Final text response — check for empty/whitespace, retry once
+    // Final text response - check for empty/whitespace, retry once
     if (!toolCalls || toolCalls.length === 0 || choice.finish_reason === "stop") {
       if (!isMeaningfulContent(content)) {
         if (streamEmptyRetryCount < 1) {
           streamEmptyRetryCount++;
           console.warn(`[Agent Loop Streaming] LLM returned empty/whitespace response, retrying... (attempt ${streamEmptyRetryCount})`);
-          sendSSE("info", { message: "⚠️ AI 回應為空，重新呼叫中..." });
+          sendSSE("info", { message: "⚠️ AI 回應為空,重新呼叫中..." });
           messages.pop();
           i--;
           continue;
         }
-        sendSSE("content", { content: "[AI 回應為空或僅含隱藏字元，重試後仍失敗]", done: true });
+        sendSSE("content", { content: "[AI 回應為空或僅含隱藏字元,重試後仍失敗]", done: true });
         contentEmitted = true;
         break;
       }
@@ -4339,7 +5127,7 @@ export async function runAgentLoopStream(config, res) {
         refreshDynamicContext(messages);
       }
 
-      // ── Vision Phase 3（2026-08-30）：同 runAgentLoop — tool result 帶圖 → 進 agent message ──
+      // ── Vision Phase 3(2026-08-30):同 runAgentLoop - tool result 帶圖 → 進 agent message ──
       let _pushToolMsg2 = toolResult;
       let _imageMsg2 = null;
       const { text: _cleanText2, imagePaths: _imgPaths2 } = extractImageMarkers(toolResult);
@@ -4348,11 +5136,11 @@ export async function runAgentLoopStream(config, res) {
           _pushToolMsg2 = _cleanText2;
           _imageMsg2 = buildImageAttachmentMessage(
             _imgPaths2,
-            "📸 [系統附圖] 這是 browser_screenshot 拍的目前畫面（系統自動附上，非使用者輸入）— 請基於畫面內容做視覺驗證"
+            "📸 [系統附圖] 這是 browser_screenshot 拍的目前畫面(系統自動附上,非使用者輸入)- 請基於畫面內容做視覺驗證"
           );
           console.log(`[Agent Loop Stream] 👁 vision attach: ${_imgPaths2.length} image(s) from ${_toolName2}`);
         } else {
-          _pushToolMsg2 = _cleanText2 + "\n（圖片已存檔但本 run 無 vision 能力 — 請改用 browser_read 讀取文字內容）";
+          _pushToolMsg2 = _cleanText2 + "\n(圖片已存檔但本 run 無 vision 能力 - 請改用 browser_read 讀取文字內容)";
         }
       }
 
@@ -4369,13 +5157,16 @@ export async function runAgentLoopStream(config, res) {
   }
 
   // If we exhausted maxTurns without a final content response, force one
-  if (!contentEmitted) {
+  // 2026-09-21 fix:使用者中斷時跳過 — 這個強制總結用同一個 abortSignal,必然立刻被殺掉,
+  // 只會送出假的 "Final summary failed: Aborted by user interrupt" error(被 stream-state 記錄、
+  // 斷線接回 poller 撿到後在 chat 顯示第三則錯誤訊息)。中斷已由 interrupted 事件表達,不需總結。
+  if (!contentEmitted && !abortSignal?.aborted) {
     try {
       messages.push({
         role: "user",
-        content: "你已經收集了足夠的資訊。現在請根據你看到的內容，直接給出完整的回答。不要使用任何工具。",
+        content: "你已經收集了足夠的資訊。現在請根據你看到的內容,直接給出完整的回答。不要使用任何工具。",
       });
-      // Vision 路由同主 loop：尾輪含圖 → 換 vision model
+      // Vision 路由同主 loop:尾輪含圖 → 換 vision model
       const _finalLlm = resolveVisionLlmConfig(llm, hasImages(messages)) || llm;
       const finalResponse = await callLLM(_finalLlm.apiUrl, _finalLlm.headers, _finalLlm.model, trimMessagesToFit(messages, llm.contextWindow || DEFAULT_CONTEXT_WINDOW), [], false, sendSSE, agentId, _finalLlm.maxTokens, abortSignal);
       const finalContent = finalResponse.choices?.[0]?.message?.content || "";
@@ -4383,7 +5174,10 @@ export async function runAgentLoopStream(config, res) {
         sendSSE("content", { content: finalContent, done: true });
       }
     } catch (err) {
-      sendSSE("error", { error: `Final summary failed: ${err.message}` });
+      // 使用者中斷不是錯誤 — 不送 error(防 race:abort 檢查後才觸發 abort 的窗口期)
+      if (!(abortSignal?.aborted || err.name === "AbortError")) {
+        sendSSE("error", { error: `Final summary failed: ${err.message}` });
+      }
     }
   }
 
@@ -4412,7 +5206,7 @@ export async function runAgentLoopStream(config, res) {
   }
 
   // ── Auto-cleanup temp files created during this session ──
-  const cleanedFiles = await cleanupTempFiles(cwd, streamCreatedFiles);
+  const cleanedFiles = await cleanupTempFiles(cwd, streamCreatedFiles, undefined, startTime);
   if (cleanedFiles > 0) {
     sendSSE("info", { message: `🧹 Cleaned up ${cleanedFiles} temporary file(s)` });
   }

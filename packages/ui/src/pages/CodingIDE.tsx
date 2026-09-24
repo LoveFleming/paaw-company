@@ -48,6 +48,7 @@ import DecisionLog from "../components/DecisionLog";
 import ModelSelector from "../components/ModelSelector";
 import { ChatMessages, type ChatMessageItem } from "../components/ChatMessages";
 import IssueTracker from "../components/IssueTracker";
+import QaRecords from "../components/QaRecords";
 import TaskBoard from "../components/TaskBoard";
 import ReleaseManagerPanel from "../components/ReleaseManagerPanel";
 import HandoverPanel from "../components/HandoverPanel";
@@ -55,11 +56,28 @@ import TroubleshootingPanel from "../components/TroubleshootingPanel";
 import TabErrorBoundary from "../components/TabErrorBoundary";
 import FeatureMap from "../components/FeatureMap";
 import ApiMapSidebar from "../components/ApiMapSidebar";
+import ApiTesterTabs from "../components/ApiTesterTabs";
 import AgentSideChat, { type AgentSideChatHandle } from "../components/AgentSideChat";
 import CrewManager from "../components/CrewManager";
 // ReportsTab removed — merged into AutoDispatchPanel
 import SecurityTab from "../components/SecurityTab";
+import { pasteMayContainImage, extractPasteFiles } from "../utils/pasteFiles";
 import FileViewer from "../pages/FileViewer";
+
+// crewId → a2a agentId（chat 發送與 stream-state 重連共用 — 2026-09-11）
+const CREW_TO_AGENT: Record<string, string> = {
+  "coding.architect": "architect",
+  "coding.helpdesk": "helpdesk",
+  "coding.developer": "developer",
+  "coding.tester": "tester",
+  "coding.doc-writer": "doc-writer",
+  "coding.qa": "qa",
+  "coding.em": "em",
+  "coding.ops": "ops",
+  "coding.handover": "handover",
+  "coding.rm": "rm",
+};
+const crewToAgentId = (crewId: string) => CREW_TO_AGENT[crewId] || crewId.replace(/^coding\./, "");
 
 // ── Types ──
 interface FsItem {
@@ -82,7 +100,7 @@ interface OpenTab {
 }
 
 // ── Main Tab Types ──
-type MainTabType = "editor" | "viewer" | "git" | "api" | "browser" | "terminal" | "ai-crew" | "sessions" | "decisions" | "em-dashboard" | "prompts" | "issues" | "tasks" | "features" | "security" | "crew-manager" | "subtask-detail" | "release-manager" | "handover" | "troubleshooting" | "code-intel" | "tests";
+type MainTabType = "editor" | "viewer" | "git" | "api" | "browser" | "terminal" | "ai-crew" | "sessions" | "decisions" | "em-dashboard" | "prompts" | "issues" | "tasks" | "features" | "security" | "crew-manager" | "subtask-detail" | "release-manager" | "handover" | "troubleshooting" | "code-intel" | "tests" | "qa-records";
 
 interface MainTab {
   id: string;
@@ -99,6 +117,7 @@ interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   ts: string;
+  files?: { name: string; size: number }[]; // 📄 文字檔附件（2026-09-14）
   _thinking?: boolean; // internal flag for intermediate thinking bubbles
   _thinkingHistory?: string[]; // preserved thinking texts before final answer replaces them
   _toolCalls?: { name: string; args?: string; result?: string }[]; // tool calls made in this turn
@@ -120,7 +139,7 @@ interface BlameLine { hash: string; author: string; authorMail: string; authorTi
 // API Tester types
 interface ApiHeader { key: string; value: string; enabled: boolean; }
 interface ApiResponse { status: number; statusText: string; headers: Record<string, string>; body: string; elapsed: number; size: number; error?: boolean; }
-interface ApiHistoryItem { id: string; ts: string; method: string; url: string; status: number; elapsed: number; headers?: ApiHeader[]; body?: string; streamMode?: boolean; response?: ApiResponse; streamResponse?: string; }
+interface ApiHistoryItem { id: string; ts: string; method: string; url: string; status: number; elapsed: number; headers?: ApiHeader[]; body?: string; streamMode?: boolean; response?: ApiResponse; streamResponse?: string; source?: "agent" | "human"; agent?: string; }
 
 // ── Constants ──
 const HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
@@ -510,6 +529,31 @@ export default function CodingIDE() {
   // 👁 2026-09-06：9 agent 聊天輸入框貼圖/附圖（agent/chat mode 走 a2a parts、domain mode 走 images）
   const [pendingImages, setPendingImages] = useState<{ id: string; dataUrl: string }[]>([]);
   const crewImageInputRef = useRef<HTMLInputElement>(null);
+  // 📄 文字檔附件（2026-09-14）：picker/貼上 → 讀文字 → 上傳 → read_file / inline
+  const [pendingChatFiles, setPendingChatFiles] = useState<{ id: string; name: string; size: number; text: string }[]>([]);
+  const crewFileInputRef = useRef<HTMLInputElement>(null);
+  const readChatFileAsText = useCallback((file: File) => new Promise<string>((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result ?? ""));
+    r.onerror = () => reject(new Error("read fail"));
+    r.readAsText(file, "utf-8");
+  }), []);
+  const addChatTextFiles = useCallback(async (files: File[]) => {
+    const texts = files.filter(f => !f.type.startsWith("image/"));
+    if (texts.length === 0) return;
+    const room = 4 - pendingChatFiles.length;
+    if (room <= 0) { alert(tt("chat.fileLimit")); return; }
+    const results: { id: string; name: string; size: number; text: string }[] = [];
+    for (const f of texts.slice(0, room)) {
+      if (f.size > 2 * 1024 * 1024) { alert(`${f.name}: ${tt("chat.fileTooLarge")}`); continue; }
+      try {
+        const text = await readChatFileAsText(f);
+        if (text.includes("\u0000")) { alert(`${f.name}: ${tt("chat.fileBinary")}`); continue; }
+        results.push({ id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, name: f.name, size: f.size, text });
+      } catch { alert(`${f.name}: ${tt("chat.fileReadFail")}`); }
+    }
+    if (results.length > 0) setPendingChatFiles(prev => [...prev, ...results].slice(0, 4));
+  }, [pendingChatFiles.length, readChatFileAsText, tt]);
   const compressChatImage = useCallback((file: File) => new Promise<string>((resolve, reject) => {
     const img = new Image();
     const url = URL.createObjectURL(file);
@@ -630,7 +674,7 @@ export default function CodingIDE() {
   const TOOL_CATEGORIES: Array<{ id: string; icon: string; tools: MainTab[] }> = [
     { id: "dev", icon: "🖥️", tools: [
       { id: "tool:crew", type: "crew-manager", label: "AI Crew", icon: "👥", closable: true },
-      { id: "tool:browser", type: "browser", label: "Browser", icon: "🧭", closable: true },
+      { id: "tool:browser", type: "browser", label: "Browser · QA", icon: "🧭", closable: true },
       { id: "tool:code-intel", type: "code-intel", label: tt("codeIntel.toolbar"), icon: "📞", closable: true },
       { id: "tool:git", type: "git", label: "Git", icon: "🔀", closable: true },
       { id: "tool:security", type: "security", label: "Security", icon: "🔒", closable: true },
@@ -638,6 +682,7 @@ export default function CodingIDE() {
     ]},
     { id: "verify", icon: "🧪", tools: [
       { id: "tool:api", type: "api", label: "API Tester", icon: "🌐", closable: true },
+      { id: "tool:qa-records", type: "qa-records", label: tt("qaRecords.toolbar"), icon: "🧾", closable: true },
       { id: "tool:tests", type: "tests", label: tt("tests.toolbar"), icon: "🧪", closable: true },
     ]},
     { id: "project", icon: "🗺️", tools: [
@@ -739,6 +784,7 @@ export default function CodingIDE() {
     setGitDiff("");
     setChatMessages(() => []);
     try { localStorage.removeItem("paaw.vibeide.rootPath"); } catch {}
+    try { sessionStorage.removeItem("paaw.vibeide.rootPath"); } catch {} // 2026-09-15：per-tab RU 記憶也要清
   }, [rootPath]);
 
   // ── Code Understanding State ──
@@ -838,15 +884,12 @@ export default function CodingIDE() {
   const [gitDiff, setGitDiff] = useState("");
   const [gitDiffFile, setGitDiffFile] = useState("");
   const [gitDiffCached, setGitDiffCached] = useState(false);
-  const [blameData, setBlameData] = useState<BlameLine[] | null>(null);
-  const [blameFile, setBlameFile] = useState("");
 
-  const [gitTab, setGitTab] = useState<"status" | "log" | "diff" | "blame" | "review">("status");
+  const [gitTab, setGitTab] = useState<"status" | "diff">("status");
   const [gitCommitMsg, setGitCommitMsg] = useState("");
   const [gitActionMsg, setGitActionMsg] = useState<string | null>(null);
   const [selectedFiles, setSelectedFiles] = useState<Set<string>>(new Set());
   const [aiCommitLoading, setAiCommitLoading] = useState(false);
-  const [gitReviews, setGitReviews] = useState<{ id: string; ts: string; comment: string; branch?: string; files?: string[] }[]>([]);
 
   // ── Staged Changes Summary (from agents) ──
   interface StagedChangeSummary {
@@ -885,6 +928,29 @@ export default function CodingIDE() {
   const [apiGroupCollapsed, setApiGroupCollapsed] = useState<Record<string, boolean>>({});
   const apiStreamAbortRef = useRef<AbortController | null>(null);
   const a2aAbortRef = useRef<AbortController | null>(null); // for interrupting A2A agent streams
+
+  // ── API Tester Collections（2026-09-24 Fleming：payload 存入 collection，左欄 tab 顯示）──
+  const [saveColOpen, setSaveColOpen] = useState(false);
+  const [saveColName, setSaveColName] = useState("");
+  const [savePayloadName, setSavePayloadName] = useState("");
+  const saveColComposingRef = useRef(false); // IME 三層保護
+  const doSaveToCollection = async () => {
+    const col = saveColName.trim();
+    const pname = savePayloadName.trim();
+    if (!col || !pname || !apiUrl) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/api-tester/collections`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          collection: col,
+          payload: { name: pname, method: apiMethod, url: apiUrl, headers: apiHeaders, body: apiBody, streamMode: apiStreamMode },
+        }),
+      });
+      if (res.ok) { setSaveColOpen(false); setSavePayloadName(""); alert(tt("apiTester.saved")); }
+      else alert(tt("apiTester.saveFailed"));
+    } catch { alert(tt("apiTester.saveFailed")); }
+  };
 
   // ── Coding Behavior Tracking ──
   const codingLogRef = useRef<CodingEvent[]>([]);
@@ -931,8 +997,9 @@ export default function CodingIDE() {
   // ═══════════════════════════════════════════════
   useEffect(() => {
     (async () => {
-      // Load root path
-      const root = localStorage.getItem("paaw.vibeide.rootPath");
+      // Load root path — 2026-09-15：sessionStorage 優先（per-tab，refresh 不會被另一個 tab 的 RU 蓋掉）；localStorage 只當新 tab 預設
+      // （兩個 Chrome 分別開不同 RU 的情境：以前 refresh 後兩邊都讀到「最後寫入的 RU」→ 同 RU → 思考中/對話兩邊同步）
+      const root = sessionStorage.getItem("paaw.vibeide.rootPath") || localStorage.getItem("paaw.vibeide.rootPath");
       if (root) { setRootPath(root); expandDir(root); registerRu(root); setSidebarTab("files"); }
       // Load API history from server
       try {
@@ -967,6 +1034,8 @@ export default function CodingIDE() {
   }, [rootPath]);
 
   useEffect(() => {
+    // 2026-09-15：sessionStorage = 這個 tab 自己的 RU（refresh 留住）；localStorage = 最後使用的 RU（新開 tab 的預設）
+    try { sessionStorage.setItem("paaw.vibeide.rootPath", rootPath); } catch {}
     try { localStorage.setItem("paaw.vibeide.rootPath", rootPath); } catch {}
   }, [rootPath]);
 
@@ -1178,6 +1247,87 @@ export default function CodingIDE() {
     return () => { if (saveConversationTimerRef.current) clearTimeout(saveConversationTimerRef.current); };
   }, [crewConversations, activeCrew, rootPath]);
 
+  // ── 2026-09-11 治本：斷線重連 — refresh/斷網後接回執行中的 agent，完成後把回覆補進對話 ──
+  // a2a message/stream 斷線後 server 繼續跑；這裡輪詢 stream-state，done 時補 finalContent（server 端也會落地，雙保險 dedupe）
+  //
+  // 2026-09-15 Fleming 回報「AI 完成工作 tool call UI 不會收起來」— 根因：
+  //   舊碼只在 exists&&done 分支重置 UI；若 run 憑空消失（server 重啟在記憶體洗掉 streamStates /
+  //   TTL 過期），poll 靜默停止 → crewLoading/crewAgentRunning 卡 true → 思考中/tool call 永遠不收。
+  //   修法：(1) run 消失時也重置（曾標記過或超過 8s grace — 避開 sendChat 註冊前的瞬間誤判）
+  //         (2) deps 加 agentRunningNow — 卡住的 tab（flag true 但 poll 已停）重新點火 watchdog 自癒
+  const reattachKeyRef = useRef<string>("");
+  const reattachMarkedRef = useRef<string>(""); // 這個 poll 標記過 running 的 crew
+  const agentRunningNow = !!(activeCrew && crewAgentRunning[activeCrew]);
+  const agentRunningSinceRef = useRef(0); // flag 變 true 的時間（sendChat 註冊 stream-state 有數百 ms 空窗，用 grace 避開）
+  useEffect(() => { if (agentRunningNow) agentRunningSinceRef.current = Date.now(); }, [agentRunningNow]);
+  useEffect(() => {
+    if (!activeCrew || !rootPath) return;
+    const a2aAgentId = crewToAgentId(activeCrew);
+    let cancelled = false;
+    let pollTimer: ReturnType<typeof setTimeout> | null = null;
+    // 收起 UI：loading/running/action 全清 — 「AI 完成」的關鍵體驗，任何路徑都不能漏
+    const _collapseRunningUi = () => {
+      setCrewLoading(prev => ({ ...prev, [activeCrew]: false }));
+      setCrewAgentRunning(prev => ({ ...prev, [activeCrew]: false }));
+      setCrewAgentAction(prev => { const n = { ...prev }; delete n[activeCrew]; return n; });
+      reattachMarkedRef.current = "";
+    };
+    const poll = async () => {
+      // 2026-09-15 17:00 Fleming：「思考中沒了、中斷鈕不見了」根因：送新訊息時（live SSE 在跑、新 run 尚未註冊），
+      // poll 讀到上一則訊息還在 TTL 窗内的 done entry → 誤判完成 → _collapseRunningUi() 砍掉 loading/running。
+      // 修法：live fetch 在跑（a2aAbortRef 有值）時 poll 不讀不寫（純等下一輪）— 顯示/收合全由 live SSE 的 tail 負責。
+      if (a2aAbortRef.current) { pollTimer = setTimeout(poll, 3000); return; }
+      try {
+        const res = await fetch(`${API_BASE}/a2a/${encodeURIComponent(a2aAgentId)}/stream-state?cwd=${encodeURIComponent(rootPath)}`);
+        const st = await res.json();
+        if (cancelled) return;
+        if (!st.exists || st.done) {
+          if (st.exists && st.done) {
+            const runKey = `${activeCrew}:${st.startedAt}`;
+            if (reattachKeyRef.current !== runKey) {
+              reattachKeyRef.current = runKey;
+              // 2026-09-21 fix：使用者中斷 → 顯示中斷訊息而非 ❌ 錯誤（以前會播出第三則「Final summary failed: Aborted by user interrupt」）
+              const isInterrupted = !!st.interrupted || /Aborted by user interrupt|Agent interrupted by user/i.test(String(st.error || ""));
+              const content = st.finalContent
+                || (isInterrupted ? "⏹️ Agent 已中斷。你可以繼續對話來恢復。" : null)
+                || (st.error ? `❌ (斷線期間結束) ${st.error}` : null);
+              if (content) {
+                setCrewConversations(prev => {
+                  const cur = prev[activeCrew] || [];
+                  const last = cur[cur.length - 1];
+                  // dedup：中斷類訊息只要一則（live SSE / 中斷鈕可能已先加過）
+                  if (isInterrupted && last?.role === "assistant" && typeof last.content === "string" && last.content.includes("已中斷")) return prev;
+                  if (last?.role === "assistant" && typeof last.content === "string" && last.content.slice(0, 200) === content.slice(0, 200)) return prev;
+                  return { ...prev, [activeCrew]: [...cur, { role: "assistant", content, ts: new Date().toISOString() }] };
+                });
+              }
+            }
+            _collapseRunningUi();
+          } else if (reattachMarkedRef.current === activeCrew || Date.now() - agentRunningSinceRef.current > 8000) {
+            // run 憑空消失（server 重啟 streamStates 在記憶體、TTL 過期）— 一定要收起，不能卡著不收
+            _collapseRunningUi();
+            return;
+          }
+          return; // 沒有執行中的 run — 停止輪詢
+        }
+        // 真正的斷線接回（無 live fetch — refresh/斷網後接回別處啟動的 run）：標記 + 顯示最新動作
+        reattachMarkedRef.current = activeCrew;
+        setCrewLoading(prev => ({ ...prev, [activeCrew]: true }));
+        setCrewAgentRunning(prev => ({ ...prev, [activeCrew]: true }));
+        const lastEv = st.events?.[st.events.length - 1];
+        if (lastEv?.event === "tool" && lastEv.data?.name) setCrewAgentAction(prev => ({ ...prev, [activeCrew]: `🔧 ${lastEv.data.name}...` }));
+        else if (lastEv?.event === "thinking") setCrewAgentAction(prev => ({ ...prev, [activeCrew]: "💭 思考中..." }));
+        else if (lastEv?.event === "content") setCrewAgentAction(prev => ({ ...prev, [activeCrew]: "✍️ 產出回應中..." }));
+        else setCrewAgentAction(prev => ({ ...prev, [activeCrew]: "🔄 Agent 執行中（已接回串流）..." }));
+        pollTimer = setTimeout(poll, 3000);
+      } catch {
+        if (!cancelled) pollTimer = setTimeout(poll, 5000);
+      }
+    };
+    poll();
+    return () => { cancelled = true; if (pollTimer) clearTimeout(pollTimer); };
+  }, [activeCrew, rootPath, agentRunningNow]); // 2026-09-15：agentRunningNow 入 deps — 卡住不收的 tab（flag true 但 poll 已停）重新點火自癒
+
   // Reset loaded crews when project changes
   useEffect(() => {
     setLoadedCrews(new Set());
@@ -1185,6 +1335,7 @@ export default function CodingIDE() {
     setArchivedConversations({});
     setViewingArchive(null);
     setShowArchivePanel(false);
+    reattachKeyRef.current = "";
   }, [rootPath]);
 
   // ═══════════════════════════════════════════════
@@ -1541,9 +1692,7 @@ export default function CodingIDE() {
   // ═══════════════════════════════════════════════
   const [chatMode, setChatMode] = useState<"chat" | "agent" | "spec" | "test" | "bug" | "docs" | "maintain">("agent");
   // ── 2026-08-29 Fleming：agent chat 內建瀏規器面板（tester 邊聊邊看 agent 操作）──
-  const [chatBrowserOpen, setChatBrowserOpen] = useState(false);
-  const [chatPanelWidth, setChatPanelWidth] = useState(380);
-  const chatBrowserDragRef = useRef<{ startX: number; startW: number } | null>(null);
+  // （2026-09-15 移除 chatBrowserOpen/chatPanelWidth/chatBrowserDragRef — browser 側欄模式退役，browser 歸 Browser 頁）
   // agentRunning/agentToolLog are now per-crew (derived from crewAgentRunning/crewAgentToolLog above)
   const [crewModels, setCrewModels] = useState<Record<string, string>>({}); // crewId → model
   const [emModel, setEmModel] = useState<string>(""); // EM Dashboard has its own model
@@ -1557,7 +1706,7 @@ export default function CodingIDE() {
   }, [activeCrew]);
 
 const sendChat = useCallback(async () => {
-    if ((!chatInput.trim() && pendingImages.length === 0) || chatLoading) return;
+    if ((!chatInput.trim() && pendingImages.length === 0 && pendingChatFiles.length === 0) || chatLoading) return;
 
     // ── No auto-archive on send: user may want to continue a conversation ──
     // Archived conversations are still viewable in sidebar; new session via button only.
@@ -1575,10 +1724,41 @@ const sendChat = useCallback(async () => {
       }));
       uploadedPaths = results.filter(Boolean) as string[];
     }
-    const sendText = chatInput.trim() || (uploadedPaths.length > 0 ? "請看這張圖" : "");
+    // 📄 文字檔（2026-09-14）：上傳 → 小檔 inline / 大檔 path 引用（agent read_file 讀）
+    const INLINE_LIMIT = 8000;
+    let fileBlocks = "";
+    const fileMeta: { name: string; size: number }[] = [];
+    if (pendingChatFiles.length > 0) {
+      const files = pendingChatFiles;
+      setPendingChatFiles([]);
+      for (const f of files) {
+        fileMeta.push({ name: f.name, size: f.size });
+        let uploaded: { abs?: string; rel?: string } | null = null;
+        try {
+          const r = await fetch(`${API_BASE}/api/uploads/text`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ content: f.text, filename: f.name, ruRoot: rootPath || undefined }),
+          });
+          const j = await r.json();
+          if (j.ok) uploaded = { abs: j.abs, rel: j.rel };
+        } catch { /* fallback inline */ }
+        const ref = uploaded?.rel || uploaded?.abs;
+        if (f.text.length <= INLINE_LIMIT) {
+          const pathNote = ref ? `\npath: ${ref}（已存檔，可用 read_file 讀取）` : "";
+          fileBlocks += `\n\n[User uploaded file: ${f.name}]${pathNote}\n\`\`\`\n${f.text}\n\`\`\``;
+        } else if (ref) {
+          fileBlocks += `\n\n[User uploaded file: ${f.name} (${f.text.length} chars)]\npath: ${ref}\n(檔案較大未內嵌 — 請用 read_file 讀取完整內容)`;
+        } else {
+          fileBlocks += `\n\n[Upload failed for ${f.name} — 檔案過大且上傳失敗，請提醒使用者重試]`;
+        }
+      }
+    }
+    const typedText = chatInput.trim() || (uploadedPaths.length > 0 ? "請看這張圖" : "");
+    let sendText = typedText + fileBlocks;
+    if (!typedText && fileMeta.length > 0) sendText = tt("chat.fileDefaultMsg") + fileBlocks; // 純檔案沒打字 → 預設提示詞
     if (!sendText) return;
 
-    const userMsg: ChatMessage = { role: "user", content: sendText, ts: new Date().toISOString(), ...(uploadedPaths.length > 0 ? { images: uploadedPaths } : {}) };
+    const userMsg: ChatMessage = { role: "user", content: sendText, ts: new Date().toISOString(), ...(uploadedPaths.length > 0 ? { images: uploadedPaths } : {}), ...(fileMeta.length > 0 ? { files: fileMeta } : {}) };
     setChatMessages(prev => [...prev, userMsg]);
     setChatInput("");
     setPendingImages([]);
@@ -1661,20 +1841,8 @@ const sendChat = useCallback(async () => {
       let finalContent = ""; // hoisted：catch 也要讀（中斷時避免重複訊息）
       try {
         // ── A2A JSON-RPC: message/stream ──
-        // Map crewId → A2A agentId
-        const CREW_TO_AGENT: Record<string, string> = {
-          "coding.architect": "architect",
-          "coding.helpdesk": "helpdesk",
-          "coding.developer": "developer",
-          "coding.tester": "tester",
-          "coding.doc-writer": "doc-writer",
-          "coding.qa": "qa",
-          "coding.em": "em",
-          "coding.ops": "ops",
-          "coding.handover": "handover",
-          "coding.rm": "rm",
-        };
-        const a2aAgentId = CREW_TO_AGENT[activeCrew || ""] || activeCrew?.replace(/^coding\./, "") || "architect";
+        // Map crewId → A2A agentId（module-level crewToAgentId）
+        const a2aAgentId = crewToAgentId(activeCrew || "coding.architect");
         const a2aAbort = new AbortController();
         a2aAbortRef.current = a2aAbort;
         const res = await fetch(`${API_BASE}/a2a/${a2aAgentId}`, {
@@ -1800,7 +1968,12 @@ const sendChat = useCallback(async () => {
                   if (currentEvent === "interrupted" || data.message?.includes?.("interrupted") || data.message?.includes?.("Interrupted")) {
                     const intMsg: ChatMessage = { role: "assistant", content: `⏹️ Agent 已中斷${data.turns ? ` (執行了 ${data.turns} 輪)` : ""}。你可以繼續對話來恢復。`, ts: new Date().toISOString() };
                     if (silentToolCalls.length > 0) intMsg._toolCalls = silentToolCalls;
-                    setChatMessages(prev => [...prev, intMsg]);
+                    // 2026-09-21 fix dedup：中斷鈕通常已先加過一則 → 只留一則，不重複
+                    setChatMessages(prev => {
+                      const last = prev[prev.length - 1];
+                      if (last?.role === "assistant" && typeof last.content === "string" && last.content.includes("已中斷")) return prev;
+                      return [...prev, intMsg];
+                    });
                     finalContent = "[interrupted]"; // prevent "no output" fallback
                     break; // exit while(reader) loop
                   }
@@ -1902,8 +2075,13 @@ const sendChat = useCallback(async () => {
         if (err.name === "AbortError") {
           // User interrupted — already handled via SSE interrupted event
           // If no interrupted event was received, show a message
+          // 2026-09-21 fix dedup：中斷鈕已立即加過一則 → 只留一則，不重複
           if (finalContent !== "[interrupted]") {
-            setChatMessages(prev => [...prev, { role: "assistant" as const, content: "⏹️ Agent 已中斷。你可以繼續對話來恢復。", ts: new Date().toISOString() }]);
+            setChatMessages(prev => {
+              const last = prev[prev.length - 1];
+              if (last?.role === "assistant" && typeof last.content === "string" && last.content.includes("已中斷")) return prev;
+              return [...prev, { role: "assistant" as const, content: "⏹️ Agent 已中斷。你可以繼續對話來恢復。", ts: new Date().toISOString() }];
+            });
           }
         } else {
           setChatMessages(prev => [...prev, { role: "assistant" as const, content: `❌ Error: ${err.message}`, ts: new Date().toISOString() }]);
@@ -1913,7 +2091,7 @@ const sendChat = useCallback(async () => {
       if (isAgentMode) setAgentRunning(false);
       a2aAbortRef.current = null;
     }
-  }, [chatInput, chatLoading, chatMode, activeTab, rootPath, logEvent, codingModel, activeCrew, pendingImages]);
+  }, [chatInput, chatLoading, chatMode, activeTab, rootPath, logEvent, codingModel, activeCrew, pendingImages, pendingChatFiles, tt]);
 
   // 追蹤使用者是否在底部附近：串流中只在使用者没往上翻時跟底（onScroll 在容器 div 上）
 
@@ -1972,114 +2150,24 @@ const sendChat = useCallback(async () => {
   }, [sendChat]);
 
   // ── Assign message to another agent: switch crew + auto-send ──
-  const assignToAgent = useCallback(async (agentId: string, messageContent: string) => {
+  // ── 指派給 Agent（2026-09-12 Fleming 定調：閒 → 貼輸入框+自動 Enter；忙 → 只跳頁不貼）──
+  const assignToAgent = useCallback((agentId: string, messageContent: string) => {
     const targetCrew = codingCrews.find(c => c.id === agentId);
     if (!targetCrew) return;
 
     const quotedContent = `> ${messageContent.slice(0, 500)}${messageContent.length > 500 ? "..." : ""}\n\n請幫我處理以上內容。`;
-    const userMsg: ChatMessage = { role: "user", content: quotedContent, ts: new Date().toISOString() };
 
-    // 1. Switch crew + tab
+    // 1. 跳到該 agent 的頁（兩種情況都跳）
     setActiveCrew(targetCrew.id);
     setChatMode(targetCrew.mode);
     openMainTab({ id: `crew:${targetCrew.id}`, type: "ai-crew", label: targetCrew.title, icon: targetCrew.emoji || "🤖", closable: true, crewId: targetCrew.id });
 
-    // 2. Add message to target crew's conversation
-    setCrewConversations(prev => ({
-      ...prev,
-      [targetCrew.id]: [...(prev[targetCrew.id] || []), userMsg],
-    }));
+    // 2. 忙 → 只跳頁不貼內容（人看到 busy 狀態自己決定；舊行為是照樣塞訊息+開 A2A — 兩條並行很亂）
+    if (crewAgentRunning[targetCrew.id] || crewLoading[targetCrew.id]) return;
 
-    // 3. Send to target agent via A2A
-    const CREW_TO_AGENT: Record<string, string> = {
-      "coding.architect": "architect",
-      "coding.helpdesk": "helpdesk",
-      "coding.developer": "developer",
-      "coding.tester": "tester",
-      "coding.doc-writer": "doc-writer",
-      "coding.qa": "qa",
-      "coding.em": "em",
-      "coding.ops": "ops",
-      "coding.handover": "handover",
-      "coding.rm": "rm",
-    };
-    const a2aAgentId = CREW_TO_AGENT[targetCrew.id] || targetCrew.id.replace(/^coding\./, "");
-    const modelForCrew = crewModels[targetCrew.id] || "";
-
-    setCrewAgentRunning(prev => ({ ...prev, [targetCrew.id]: true }));
-    setCrewAgentAction(prev => ({ ...prev, [targetCrew.id]: "thinking" }));
-
-    try {
-      const res = await fetch(`${API_BASE}/a2a/${a2aAgentId}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          method: "message/stream",
-          params: {
-            message: { role: "user", parts: [{ type: "text", text: quotedContent }] },
-            context: { cwd: rootPath || undefined },
-            metadata: modelForCrew ? { model: modelForCrew } : undefined,
-            conversationHistory: (crewConversations[targetCrew.id] || []).map(({ _greeting, ...rest }: any) => rest),
-          },
-          id: `assign-${Date.now()}`,
-        }),
-      });
-
-      if (!res.ok || !res.body) {
-        const errText = await res.text();
-        setCrewConversations(prev => ({
-          ...prev,
-          [targetCrew.id]: [...(prev[targetCrew.id] || []), { role: "assistant", content: `❌ Agent error: ${errText.slice(0, 200)}`, ts: new Date().toISOString() }],
-        }));
-        return;
-      }
-
-      const reader = res.body?.getReader();
-      const decoder = new TextDecoder();
-      let finalContent = "";
-      let buffer = "";
-
-      while (reader) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          try {
-            const evt = JSON.parse(line.slice(6));
-            if (evt.type === "thinking") {
-              setCrewAgentAction(prev => ({ ...prev, [targetCrew.id]: "thinking" }));
-            } else if (evt.type === "tool_call") {
-              setCrewAgentAction(prev => ({ ...prev, [targetCrew.id]: `tool:${evt.name || "?"}` }));
-            } else if (evt.type === "tool_result") {
-              setCrewAgentAction(prev => ({ ...prev, [targetCrew.id]: "thinking" }));
-            } else if (evt.type === "content" || evt.type === "text") {
-              finalContent += evt.text || evt.content || "";
-            } else if (evt.type === "done" || evt.type === "complete") {
-              finalContent += evt.text || evt.content || evt.result?.content || "";
-            }
-          } catch {}
-        }
-      }
-
-      const reply = finalContent.trim() || "(已完成，無輸出)";
-      setCrewConversations(prev => ({
-        ...prev,
-        [targetCrew.id]: [...(prev[targetCrew.id] || []), { role: "assistant", content: reply, ts: new Date().toISOString() }],
-      }));
-    } catch (err: any) {
-      setCrewConversations(prev => ({
-        ...prev,
-        [targetCrew.id]: [...(prev[targetCrew.id] || []), { role: "assistant", content: `❌ 指派失敗: ${err.message}`, ts: new Date().toISOString() }],
-      }));
-    } finally {
-      setCrewAgentRunning(prev => ({ ...prev, [targetCrew.id]: false }));
-      setCrewAgentAction(prev => ({ ...prev, [targetCrew.id]: "" }));
-    }
-  }, [codingCrews, rootPath, crewConversations, crewModels, openMainTab]);
+    // 3. 閒 → 文字貼進輸入框就好，不按 Enter — 人自己補字/按下送出（2026-09-12 Fleming：可能要多加文字）
+    setChatInput(quotedContent);
+  }, [codingCrews, crewAgentRunning, crewLoading, openMainTab]);
 
   const handleChatKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (composingRef.current || e.nativeEvent.isComposing || e.keyCode === 229) return; // IME guard
@@ -2125,163 +2213,9 @@ const sendChat = useCallback(async () => {
     try { const res = await fetch(`${API_BASE}/api/vibe-git/diff?${params}`); const data = await res.json(); setGitDiff(data.diff || ""); setGitDiffFile(file || ""); setGitDiffCached(!!cached); } catch {}
   }, [rootPath]);
 
-  const loadBlame = useCallback(async (filePath: string) => {
-    if (!rootPath) return;
-    try { const res = await fetch(`${API_BASE}/api/vibe-git/blame?path=${encodeURIComponent(rootPath)}&file=${encodeURIComponent(filePath)}`); const data = await res.json(); setBlameData(data.lines || []); setBlameFile(filePath); setGitTab("blame"); setActiveSubPanel("blame"); } catch {}
-  }, [rootPath]);
 
   // ── QA Code Review: send staged diff to QA agent (武大安) ──
-  const [qaReviewLoading, setQaReviewLoading] = useState(false);
-  const [qaReview, setQaReview] = useState("");
-  const [qaVerdict, setQaVerdict] = useState<{ verdict: string; issues: number; critical: number; summary: string; feedback: string } | null>(null);
-  // ── Parse QA verdict from review text ──
-  function parseQaVerdict(text: string): { verdict: string; issues: number; critical: number; summary: string; feedback: string } | null {
-    const match = text.match(/---QA_VERDICT---[\s\S]*?---END_VERDICT---/);
-    if (!match) return null;
-    const block = match[0];
-    const verdict = (block.match(/verdict:\s*(pass|conditional|rework)/)?.[1] || "").toLowerCase();
-    const issues = parseInt(block.match(/issues:\s*(\d+)/)?.[1] || "0");
-    const critical = parseInt(block.match(/critical:\s*(\d+)/)?.[1] || "0");
-    const summary = (block.match(/summary:\s*(.+)/)?.[1] || "").trim();
-    const feedback = (block.match(/feedback:\s*([\s\S]*?)(?=---END_VERDICT---|$)/)?.[1] || "").trim();
-    if (!verdict) return null;
-    return { verdict, issues, critical, summary, feedback };
-  }
 
-  const runQaReview = useCallback(async () => {
-    if (!rootPath) return;
-    setQaReviewLoading(true);
-    setQaReview("");
-    setGitTab("review");
-    try {
-      // Get staged diff (fallback to working diff)
-      let diffText = gitDiff;
-      if (!diffText) {
-        const diffRes = await fetch(`${API_BASE}/api/vibe-git/diff?path=${encodeURIComponent(rootPath)}&cached=true`);
-        const diffData = await diffRes.json();
-        diffText = diffData.diff || "";
-      }
-      if (!diffText) {
-        const diffRes = await fetch(`${API_BASE}/api/vibe-git/diff?path=${encodeURIComponent(rootPath)}`);
-        diffText = (await diffRes.json()).diff || "";
-      }
-      // Build review request for QA agent — 強調結構化 verdict
-      const fileList = gitStatus?.staged?.map(f => f.path).join(", ") || gitStatus?.all?.map(f => f.path).join(", ") || "";
-      const reviewTask = `請 review 以下 staged diff，這是另一個 agent 剛完成的變更。
-
-**變更檔案：** ${fileList}
-**分支：** ${gitStatus?.branch || "unknown"}
-
-**Diff：**
-\n${'```'}diff
-${diffText.slice(0, 12000)}
-${'```'}\n
-請檢查：
-1. ⚠️ 潛在 bug 或邊界情況
-2. 🔒 安全問題
-3. 🔄 跨平台相容性
-4. ♿ 可訪問性
-5. 📝 缺漏的錯誤處理
-6. 🧪 建議的測試步驟
-
-⚠️ **重要：你的回覆最後必須包含結構化 verdict 區塊：**
-\`\`\`
----QA_VERDICT---
-verdict: pass 或 conditional 或 rework
-issues: 數字
-critical: 數字
-summary: 一句話總結
-feedback: 具體修正建議（rework 時必須給）
----END_VERDICT---
-\`\`\`
-
-${gitLog[0] ? `**最近 commit：** ${gitLog[0].short} ${gitLog[0].subject}` : ""}`;
-
-      const res = await fetch(`${API_BASE}/api/coding-crew/dispatch`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ agentId: "qa", task: reviewTask, cwd: rootPath }),
-      });
-      if (!res.ok) {
-        const errText = await res.text();
-        setQaReview(`❌ QA Agent 派工失敗: ${errText.slice(0, 200)}`);
-        setQaReviewLoading(false);
-        return;
-      }
-      // Read SSE stream
-      const reader = res.body?.getReader();
-      const decoder = new TextDecoder();
-      let result = "";
-      let buffer = "";
-      let currentEvent = "";
-      if (reader) {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
-          for (const line of lines) {
-            if (line.startsWith("event:")) currentEvent = line.slice(6).trim();
-            if (line.startsWith("data:")) {
-              try {
-                const evt = JSON.parse(line.slice(5).trim());
-                if (currentEvent === "text" && evt.text) {
-                  result += evt.text;
-                  setQaReview(result);
-                }
-              } catch {}
-            }
-          }
-        }
-      }
-
-      // ══ Parse QA verdict and drive pipeline ══
-      const verdict = parseQaVerdict(result);
-      if (verdict) {
-        setQaVerdict(verdict);
-        // Find active task to update pipeline
-        if (activeCodingTaskId) {
-          try {
-            if (verdict.verdict === "pass") {
-              // ✅ Pass → advance QA phase → commit phase awaits human
-              await fetch(`${API_BASE}/api/coding-tasks/${encodeURIComponent(activeCodingTaskId)}/pipeline/advance?path=${encodeURIComponent(rootPath)}`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ phase: "qa", result: verdict.summary, by: "qa-agent" }),
-              });
-            } else if (verdict.verdict === "rework") {
-              // ❌ Rework → reject QA phase → return to implement
-              await fetch(`${API_BASE}/api/coding-tasks/${encodeURIComponent(activeCodingTaskId)}/pipeline/reject?path=${encodeURIComponent(rootPath)}`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  phase: "qa",
-                  status: "rework",
-                  reason: verdict.summary,
-                  feedback: verdict.feedback,
-                  by: "qa-agent",
-                  returnTo: "implement",
-                }),
-              });
-            }
-            // conditional → leave for human to decide
-          } catch (e: any) {
-            console.error("Pipeline action failed:", e.message);
-          }
-        }
-      }
-
-      // Save review to server
-      try {
-        await fetch(`${API_BASE}/api/vibe-git/reviews?path=${encodeURIComponent(rootPath)}`, {
-          method: "POST", headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ comment: result, branch: gitStatus?.branch, files: gitStatus?.staged?.map(f => f.path), diffLength: diffText?.length, verdict: verdict?.verdict || null }),
-        });
-      } catch {}
-    } catch (err: any) { setQaReview(`❌ Error: ${err.message}`); }
-    setQaReviewLoading(false);
-  }, [rootPath, gitDiff, gitLog, gitStatus, activeCodingTaskId]);
 
   // Auto-refresh git when panel opens or when switching to git tab
   useEffect(() => {
@@ -2312,13 +2246,6 @@ ${gitLog[0] ? `**最近 commit：** ${gitLog[0].short} ${gitLog[0].subject}` : "
     }
   }, [activeMainTab?.type, rootPath, showGitPanel]);
 
-  // Load git reviews when entering review tab
-  useEffect(() => {
-    if (gitTab === "review" && rootPath) {
-      fetch(`${API_BASE}/api/vibe-git/reviews?path=${encodeURIComponent(rootPath)}`)
-        .then(r => r.json()).then(data => { if (data.reviews) setGitReviews(data.reviews); }).catch(() => {});
-    }
-  }, [gitTab, rootPath]);
 
   // ═══════════════════════════════════════════════
   // API Tester
@@ -2363,7 +2290,7 @@ ${gitLog[0] ? `**最近 commit：** ${gitLog[0].short} ${gitLog[0].subject}` : "
         }
 
         const elapsed = Date.now() - startTime;
-        const item: ApiHistoryItem = { id: `req-${Date.now()}`, ts: new Date().toISOString(), method: apiMethod, url: apiUrl, status: status || 200, elapsed, headers: [...apiHeaders], body: apiBody, streamMode: apiStreamMode, streamResponse: accumulated };
+        const item: ApiHistoryItem = { id: `req-${Date.now()}`, ts: new Date().toISOString(), method: apiMethod, url: apiUrl, status: status || 200, elapsed, headers: [...apiHeaders], body: apiBody, streamMode: apiStreamMode, streamResponse: accumulated, source: "human" };
         setApiHistory(prev => [item, ...prev].slice(0, 50));
         try { await fetch(`${API_BASE}/api/api-tester/save`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(item) }); } catch {}
       } catch (err: any) {
@@ -2392,7 +2319,7 @@ ${gitLog[0] ? `**最近 commit：** ${gitLog[0].short} ${gitLog[0].subject}` : "
       const data = await res.json();
       setApiResponse(data);
       // Save to history
-      const item: ApiHistoryItem = { id: `req-${Date.now()}`, ts: new Date().toISOString(), method: apiMethod, url: apiUrl, status: data.status, elapsed: data.elapsed, headers: [...apiHeaders], body: apiBody, streamMode: apiStreamMode, response: data };
+      const item: ApiHistoryItem = { id: `req-${Date.now()}`, ts: new Date().toISOString(), method: apiMethod, url: apiUrl, status: data.status, elapsed: data.elapsed, headers: [...apiHeaders], body: apiBody, streamMode: apiStreamMode, response: data, source: "human" };
       setApiHistory(prev => [item, ...prev].slice(0, 50));
       // Save to server
       try { await fetch(`${API_BASE}/api/api-tester/save`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(item) }); } catch {}
@@ -3027,12 +2954,39 @@ ${gitLog[0] ? `**最近 commit：** ${gitLog[0].short} ${gitLog[0].subject}` : "
               );
             })}
 
-            {/* === GIT PANEL (New Component) === */}
-            {activeMainTab?.type === "browser" && (
-              <div className="absolute inset-0 flex flex-col overflow-hidden">
-                <BrowserPanel API_BASE={API_BASE} />
+            {/* === BROWSER PANEL + QA SIDE CHAT（2026-09-15 Fleming：browser page 掛 QA 武大安 side chat，像 Release Manager 頁掛 rm；其它 agent 只留 browser API）=== */}
+            {/* 2026-09-17 Fleming：改 keep-alive（visibility 切換，同 file viewer）— 切 tab 不再 unmount，*/}
+            {/*   BrowserPanel 串流/畫面 + QA side chat 對話都保留；tab 關掉才真的卸載。*/}
+            {/*   side chat 加 persistCrewId="coding.qa-browser" → 對話存 .paaw/coding-memory（跟 crew chat 同一套），*/}
+            {/*   並有 📋 歷史 / 🧠 注入 prompt / 💬 新對話 三按鈕（重整/restart 也撐得性回來）*/}
+            {mainTabs.some(t => t.type === "browser") && (() => {
+              const browserActive = activeMainTab?.type === "browser";
+              return (
+              <div className="absolute inset-0 flex overflow-hidden"
+                style={{ visibility: browserActive ? "visible" : "hidden", zIndex: browserActive ? 1 : 0, pointerEvents: browserActive ? "auto" : "none" }}>
+                <div className="flex-1 min-w-0 flex flex-col overflow-hidden">
+                  <BrowserPanel API_BASE={API_BASE} rootPath={rootPath} />
+                </div>
+                <div className="shrink-0 border-l hidden md:flex flex-col" style={{ width: 360, borderColor: tk.borderLight }}>
+                  <AgentSideChat
+                    agentId="qa"
+                    agentName={tt("qaBrowser.agentName")}
+                    agentEmoji="🔬"
+                    greeting={tt("qaBrowser.greeting")}
+                    cwd={rootPath}
+                    accent={tk.accent}
+                    height="100%"
+                    persistCrewId="coding.qa-browser"
+                    suggestions={[
+                      { label: tt("qaBrowser.sugSmoke"), prompt: tt("qaBrowser.sugSmokePrompt") },
+                      { label: tt("qaBrowser.sugCheck"), prompt: tt("qaBrowser.sugCheckPrompt") },
+                      { label: tt("qaBrowser.sugShot"), prompt: tt("qaBrowser.sugShotPrompt") },
+                    ]}
+                  />
+                </div>
               </div>
-            )}
+              );
+            })()}
             {activeMainTab?.type === "git" && (
               <GitPanel
                 rootPath={rootPath!}
@@ -3047,12 +3001,6 @@ ${gitLog[0] ? `**最近 commit：** ${gitLog[0].short} ${gitLog[0].subject}` : "
                 selectedFiles={selectedFiles}
                 aiCommitLoading={aiCommitLoading}
                 stagedSummary={stagedSummary}
-                qaReview={qaReview}
-                qaVerdict={qaVerdict}
-                qaReviewLoading={qaReviewLoading}
-                gitReviews={gitReviews}
-                blameData={blameData}
-                blameFile={blameFile}
                 activeCodingTask={activeCodingTaskId ? { id: activeCodingTaskId, title: stagedSummary?.task || "", pipeline: activeTaskPipeline ?? undefined } : null}
                 setGitTab={setGitTab}
                 setGitCommitMsg={setGitCommitMsg}
@@ -3066,7 +3014,6 @@ ${gitLog[0] ? `**最近 commit：** ${gitLog[0].short} ${gitLog[0].subject}` : "
                 refreshGitStatus={refreshGitStatus}
                 refreshGitLog={refreshGitLog}
                 loadGitDiff={loadGitDiff}
-                runQaReview={runQaReview}
                 fmtTime={fmtTime}
                 theme={tk}
                 tt={tt}
@@ -3077,9 +3024,9 @@ ${gitLog[0] ? `**最近 commit：** ${gitLog[0].short} ${gitLog[0].subject}` : "
             {/* === API TESTER（三欄：API 地圖 | 測試台 | Developer AI）=== */}
             {activeMainTab?.type === "api" && (
               <div className="flex-1 flex min-w-0 overflow-hidden" data-testid="api-tester-page">
-                {/* 左欄：API 地圖宮殿 */}
+                {/* 左欄：tab sheet — Feature / Collection / History（2026-09-24 Fleming）*/}
                 <div className="shrink-0 border-r hidden lg:flex flex-col" style={{ width: 264, borderColor: tk.borderLight }}>
-                  <ApiMapSidebar
+                  <ApiTesterTabs
                     rootPath={rootPath}
                     onPick={(m, p) => {
                       const base = rootPath ? `http://localhost:${new URL(API_BASE).port}` : API_BASE;
@@ -3089,7 +3036,23 @@ ${gitLog[0] ? `**最近 commit：** ${gitLog[0].short} ${gitLog[0].subject}` : "
                     }}
                     onOpenFile={(abs) => { openFile(abs); }}
                     onAskAi={(prompt) => { apiDevChatRef.current?.send(prompt); }}
+                    onLoadPayload={(p) => {
+                      setApiMethod(p.method || "GET");
+                      setApiUrl(p.url);
+                      setApiHeaders(Array.isArray(p.headers) && p.headers.length ? p.headers : [{ key: "Content-Type", value: "application/json", enabled: true }]);
+                      setApiBody(p.body ?? "");
+                      setApiStreamMode(!!p.streamMode);
+                    }}
+                    apiHistory={apiHistory}
+                    onClearHistory={async () => {
+                      setApiHistory([]);
+                      try { await fetch(`${API_BASE}/api/api-tester/history`, { method: "DELETE" }); } catch {}
+                    }}
+                    refreshHistory={async () => {
+                      try { const res = await fetch(`${API_BASE}/api/api-tester/history`); const data = await res.json(); if (data.history) setApiHistory(data.history); } catch {}
+                    }}
                     borderLight={tk.borderLight}
+                    borderInput={tk.borderInput}
                   />
                 </div>
                 {/* 中欄：request builder + response（原有）*/}
@@ -3128,36 +3091,35 @@ ${gitLog[0] ? `**最近 commit：** ${gitLog[0].short} ${gitLog[0].subject}` : "
                         🧪 AI
                       </button>
                     )}
-                    {apiHistory.length > 0 && (
-                      <div className="relative group">
-                        <button className="text-xs px-2 py-0.5 rounded-full bg-stone-100 text-stone-500 hover:bg-stone-200 font-semibold">
-                          📜 {apiHistory.length}
-                        </button>
-                        {/* Dropdown */}
-                        <div className="absolute right-0 top-full mt-1 w-80 max-h-64 overflow-y-auto bg-white rounded-lg shadow-xl border z-50 hidden group-hover:block" style={{ borderColor: tk.borderInput }}>
-                          <div className="flex items-center px-3 py-1.5 sticky top-0 bg-white z-10" style={{ borderBottom: `1px solid ${tk.borderLight}` }}>
-                            <span className="text-xs font-bold text-stone-500">History</span>
-                            <span className="flex-1" />
-                            <button onClick={() => setApiHistory([])} className="text-xs text-red-400 hover:text-red-600">Clear</button>
-                          </div>
-                          {apiHistory.map((h, hi) => (
-                            <div key={h.id || hi} className="flex flex-col px-3 py-1.5 hover:bg-stone-50 cursor-pointer" style={{ borderBottom: "1px solid #f5f5f5" }}
-                              onClick={() => { setApiMethod(h.method); setApiUrl(h.url); if (h.headers) setApiHeaders(h.headers); if (h.body !== undefined) setApiBody(h.body); if (h.streamMode !== undefined) setApiStreamMode(h.streamMode); }}>
-                              <div className="flex items-center gap-2">
-                                <span className="text-xs font-bold w-10 shrink-0" style={{ color: METHOD_COLORS[h.method] || "#6B7280" }}>{h.method}</span>
-                                <span className="text-stone-600 truncate flex-1 font-mono text-xs">{h.url}</span>
-                                <span className="text-xs font-bold shrink-0" style={{ color: h.status < 300 ? "#10B981" : h.status < 400 ? "#F59E0B" : "#EF4444" }}>{h.status}</span>
-                                <span className="text-xs text-stone-400 shrink-0">{h.elapsed}ms</span>
-                              </div>
-                              {/* Response preview for e2e */}
-                              {(h.response?.body || h.streamResponse) && (
-                                <pre className="text-xs font-mono text-stone-400 mt-0.5 truncate">{tryFormatJson(h.response?.body || h.streamResponse || "").slice(0, 120)}</pre>
-                              )}
-                            </div>
-                          ))}
+                    <div className="relative">
+                      <button onClick={() => setSaveColOpen(v => !v)} className="text-xs px-2 py-0.5 rounded-full bg-amber-100 text-amber-600 hover:bg-amber-200 font-bold" title={tt("apiTester.saveToCollection")}>
+                        💾+
+                      </button>
+                      {/* 存入 Collection popover */}
+                      {saveColOpen && (
+                        <div className="absolute right-0 top-full mt-1 w-64 bg-white rounded-lg shadow-xl border p-2 space-y-1.5 z-50" style={{ borderColor: tk.borderInput }}>
+                        <div className="text-xs font-bold text-stone-500">{tt("apiTester.saveToCollection")}</div>
+                        <input value={saveColName} onChange={e => setSaveColName(e.target.value)}
+                          onCompositionStart={() => { saveColComposingRef.current = true; }}
+                          onCompositionEnd={() => { saveColComposingRef.current = false; }}
+                          placeholder={tt("apiTester.collectionNamePh")} className="w-full text-xs px-2 py-1 rounded border bg-transparent outline-none focus:border-amber-400" style={{ borderColor: tk.borderInput }} />
+                        <input value={savePayloadName} onChange={e => setSavePayloadName(e.target.value)}
+                          onCompositionStart={() => { saveColComposingRef.current = true; }}
+                          onCompositionEnd={() => { saveColComposingRef.current = false; }}
+                          onKeyDown={async (e) => {
+                            if (saveColComposingRef.current || e.nativeEvent.isComposing || e.keyCode === 229) return;
+                            if (e.key === "Enter") { e.preventDefault(); await doSaveToCollection(); }
+                          }}
+                          placeholder={tt("apiTester.payloadNamePh")} className="w-full text-xs px-2 py-1 rounded border bg-transparent outline-none focus:border-amber-400" style={{ borderColor: tk.borderInput }} />
+                        <div className="flex gap-1.5">
+                          <button onClick={doSaveToCollection} disabled={!saveColName.trim() || !savePayloadName.trim() || !apiUrl}
+                            className="flex-1 text-xs px-2 py-1 rounded bg-amber-500 text-white font-bold hover:bg-amber-600 disabled:opacity-40">{tt("apiTester.save")}</button>
+                          <button onClick={() => setSaveColOpen(false)} className="text-xs px-2 py-1 rounded text-stone-400 hover:text-stone-600">{tt("apiTester.cancel")}</button>
                         </div>
-                      </div>
-                    )}
+                        </div>
+                      )}
+                    </div>
+                        {/* Dropdown */}
                   </div>
                   {/* Quick URLs */}
                   <div className="flex flex-wrap gap-1 mb-1">
@@ -3420,27 +3382,20 @@ ${gitLog[0] ? `**最近 commit：** ${gitLog[0].short} ${gitLog[0].subject}` : "
                       {viewingArchive && (
                         <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-600">📂 歷史</span>
                       )}
-                      {/* Browser panel toggle — 2026-08-29 Fleming：agent chat 邊聊邊看 agent 操作 browser */}
-                      <button
-                        onClick={() => setChatBrowserOpen(!chatBrowserOpen)}
-                        className="text-xs px-2 py-1 rounded transition-colors"
-                        style={{ color: chatBrowserOpen ? tk.accent : undefined }}
-                        title={tt("coding.chatBrowserToggle")}
-                      >
-                        🌐
-                      </button>
-                      {/* History button */}
+                      {/* Browser panel toggle 已移除（2026-09-15 Fleming）：browser 不再每個 agent chat 都能用，改掛在 Browser 頁的 QA 武大安 side chat（RM 同款）*/}
+                      {/* History button — 2026-09-12 統一 accent 色外框 */}
                       <button
                         onClick={() => {
                           if (!showArchivePanel && activeCrew && rootPath) loadArchivedConversations(activeCrew, rootPath);
                           setShowArchivePanel(!showArchivePanel);
                         }}
-                        className="text-xs px-2 py-1 rounded text-stone-500 hover:bg-stone-100 transition-colors"
+                        className="text-xs px-2 py-1 rounded-lg border transition-colors hover:bg-stone-50"
+                        style={{ borderColor: tk.accentBorder, color: tk.accent }}
                         title="歷史對話"
                       >
                         📋
                       </button>
-                      {/* Context debug button */}
+                      {/* Context debug button — 2026-09-12 Fleming：🔍 改 🧠（不是搜尋）；統一 accent 色外框 */}
                       <button
                         onClick={async () => {
                           if (!activeCrew) return;
@@ -3455,19 +3410,21 @@ ${gitLog[0] ? `**最近 commit：** ${gitLog[0].short} ${gitLog[0].subject}` : "
                             setShowContextDebug(true);
                           }
                         }}
-                        className="text-xs px-2 py-1 rounded text-stone-500 hover:bg-stone-100 transition-colors"
+                        className="text-xs px-2 py-1 rounded-lg border transition-colors hover:bg-stone-50"
+                        style={{ borderColor: tk.accentBorder, color: tk.accent }}
                         title="查看注入的 Context & Prompts"
                       >
-                        🔍
+                        🧠
                       </button>
-                      {/* New conversation button */}
+                      {/* New conversation button — 2026-09-12 Fleming：跟林雨晴一樣用 💬 chat 圖示；統一 accent 色外框 */}
                       <button
                         onClick={startNewConversation}
                         disabled={chatMessages.length === 0}
-                        className="text-xs px-2 py-1 rounded text-stone-500 hover:bg-stone-100 disabled:opacity-30 transition-colors"
+                        className="text-xs px-2 py-1 rounded-lg border transition-colors hover:bg-stone-50 disabled:opacity-30"
+                        style={{ borderColor: tk.accentBorder, color: tk.accent }}
                         title="開新對話"
                       >
-                        ✨
+                        💬
                       </button>
                       <ModelSelector feature={`codingIDE.${activeCrew}`} value={codingModel} onChange={setCodingModel} />
                     </div>
@@ -3514,17 +3471,9 @@ ${gitLog[0] ? `**最近 commit：** ${gitLog[0].short} ${gitLog[0].subject}` : "
                   </div>
                 )}
 
-                {/* v3（Fleming：跟其他 tab 一樣 chat 放右邊）：browser 左（flex-1 大畫面）｜chat 右 sidebar */}
+                {/* chat 全幅（2026-09-15：browser 側欄模式移除，browser 歸 Browser 頁的 QA side chat 管） */}
                 <div className="flex-1 flex min-h-0 min-w-0">
-                {chatBrowserOpen && isCrewActive && (
-                  <div className="flex-1 flex flex-col min-h-0 min-w-0">
-                    <BrowserPanel API_BASE={API_BASE} />
-                  </div>
-                )}
-                <div
-                  className={chatBrowserOpen && isCrewActive ? "shrink-0 flex flex-col min-h-0 relative" : "flex-1 flex flex-col min-h-0 min-w-0"}
-                  style={chatBrowserOpen && isCrewActive ? { width: chatPanelWidth, borderLeft: `1px solid ${tk.borderLight}` } : undefined}
-                >
+                <div className="flex-1 flex flex-col min-h-0 min-w-0">
                 {/* Chat messages */}
                 <div ref={chatScrollRef} className="flex-1 overflow-y-auto px-4 py-3 space-y-3" style={{ scrollbarWidth: "thin" }} onScroll={(e) => {
                   const el = e.currentTarget;
@@ -3600,7 +3549,7 @@ ${gitLog[0] ? `**最近 commit：** ${gitLog[0].short} ${gitLog[0].subject}` : "
                           {t.result !== "..." ? "✓" : "⏳"}
                         </span>
                         <span className="font-mono text-stone-600">{t.name}</span>
-                        <span className="text-stone-400 truncate max-w-[200px]">{t.args}</span>
+                        <span className="text-stone-400 truncate max-w-[480px]" title={t.args}>{t.args}</span>
                       </div>
                     ))}
                   </div>
@@ -3621,17 +3570,45 @@ ${gitLog[0] ? `**最近 commit：** ${gitLog[0].short} ${gitLog[0].subject}` : "
                       ))}
                     </div>
                   )}
+                  {/* 📄 待送文字檔 chip */}
+                  {pendingChatFiles.length > 0 && (
+                    <div className="flex gap-2 mb-2 flex-wrap">
+                      {pendingChatFiles.map(f => (
+                        <div key={f.id} className="relative group">
+                          <span className="inline-flex items-center gap-1.5 px-2 py-1.5 rounded-lg bg-white border border-stone-200 text-xs text-stone-600 max-w-[220px]">
+                            <span>📄</span>
+                            <span className="truncate" title={f.name}>{f.name}</span>
+                            <span className="text-stone-400 shrink-0">{(f.size / 1024).toFixed(1)}KB</span>
+                          </span>
+                          <button
+                            onClick={() => setPendingChatFiles(prev => prev.filter(p => p.id !== f.id))}
+                            className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-stone-600 text-white text-xs leading-none hidden group-hover:flex items-center justify-center"
+                            title="移除">✕</button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                   <div className="flex items-end gap-2">
                     <input ref={crewImageInputRef} type="file" accept="image/*" multiple className="hidden" onChange={(e) => { addChatImages(Array.from(e.target.files || [])); e.target.value = ""; }} />
                     <button onClick={() => crewImageInputRef.current?.click()} disabled={pendingImages.length >= 4} title={tt("chat.attachImage")}
                       className="text-xs px-2 py-2 rounded-lg border border-stone-200 text-stone-500 hover:text-stone-700 hover:border-stone-300 disabled:opacity-40 shrink-0 bg-stone-50">📎</button>
+                    {/* 📄 文字檔鈕（2026-09-14）*/}
+                    <input ref={crewFileInputRef} type="file" multiple className="hidden" onChange={(e) => { addChatTextFiles(Array.from(e.target.files || [])); e.target.value = ""; }} />
+                    <button onClick={() => crewFileInputRef.current?.click()} disabled={pendingChatFiles.length >= 4} title={tt("chat.attachFile")}
+                      className="text-xs px-2 py-2 rounded-lg border border-stone-200 text-stone-500 hover:text-stone-700 hover:border-stone-300 disabled:opacity-40 shrink-0 bg-stone-50">📄</button>
                     <textarea
                       ref={chatInputRef}
                       value={chatInput}
                       onChange={e => setChatInput(e.target.value)}
                       onCompositionStart={() => { composingRef.current = true; }}
                       onCompositionEnd={() => { composingRef.current = false; }}
-                      onPaste={(e) => { const files = Array.from(e.clipboardData?.files || []); if (files.length > 0) { e.preventDefault(); addChatImages(files); } }}
+                      onPaste={async (e) => {
+                        // 2026-09-16：貼圓修復 — files/items/text-html 全支援（browser 照相複製圖片不再變文字）
+                        if (!pasteMayContainImage(e.clipboardData)) return;
+                        e.preventDefault();
+                        const files = await extractPasteFiles(e.clipboardData);
+                        if (files && files.length > 0) { addChatImages(files); addChatTextFiles(files); }
+                      }}
                       onKeyDown={handleChatKeyDown}
                       placeholder={`問 ${crew?.title}...`}
                       className="flex-1 text-sm px-3 py-2 rounded-lg resize-none outline-none border focus:border-blue-400"
@@ -3655,15 +3632,16 @@ ${gitLog[0] ? `**最近 commit：** ${gitLog[0].short} ${gitLog[0].subject}` : "
                             domainAbortRef.current.abort();
                             domainAbortRef.current = null;
                           }
-                          // Tell server to kill the running stream (agent mode)
+                          // Tell server to kill the running stream (agent mode) — 2026-09-15：帶 cwd 只殺這個 RU 的 run，不誤殺另一個 RU 同 agent
                           const aid = activeCrew?.replace(/^coding\./, "") || "architect";
-                          fetch(`${API_BASE}/api/coding-crew/interrupt`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ agentId: aid }) }).catch(() => {});
-                          fetch(`${API_BASE}/api/a2a/interrupt`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ agentId: aid }) }).catch(() => {});
+                          fetch(`${API_BASE}/api/coding-crew/interrupt`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ agentId: aid, cwd: rootPath || undefined }) }).catch(() => {});
+                          fetch(`${API_BASE}/api/a2a/interrupt`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ agentId: aid, cwd: rootPath || undefined }) }).catch(() => {});
 
                           // Add interrupted message if not already there
+                          // 2026-09-21 fix：只檢查 assistant 訊息（user 訊息內含「中斷」二字不该誤判）
                           setChatMessages(prev => {
                             const last = prev[prev.length - 1];
-                            if (last?.content?.includes("中斷")) return prev; // already has interrupt msg
+                            if (last?.role === "assistant" && last?.content?.includes("中斷")) return prev; // already has interrupt msg
                             return [...prev, { role: "assistant" as const, content: "⏹️ Agent 已中斷。", ts: new Date().toISOString() }];
                           });
                         }}
@@ -3672,8 +3650,8 @@ ${gitLog[0] ? `**最近 commit：** ${gitLog[0].short} ${gitLog[0].subject}` : "
                       >中斷</button>
                     )}
                     <button
-                      onClick={() => { if (!chatInput.trim() && pendingImages.length === 0) return; sendChat(); }}
-                      disabled={chatLoading || (!chatInput.trim() && pendingImages.length === 0)}
+                      onClick={() => { if (!chatInput.trim() && pendingImages.length === 0 && pendingChatFiles.length === 0) return; sendChat(); }}
+                      disabled={chatLoading || (!chatInput.trim() && pendingImages.length === 0 && pendingChatFiles.length === 0)}
                       className="px-4 py-2 rounded-lg text-sm font-bold text-white disabled:opacity-40 transition-colors"
                       style={{ backgroundColor: chatLoading ? '#a1a1aa' : tk.accent }}>
                       送出
@@ -3681,29 +3659,6 @@ ${gitLog[0] ? `**最近 commit：** ${gitLog[0].short} ${gitLog[0].subject}` : "
                   </div>
                 </div>
                 </div>
-                {/* chat sidebar 左緣拖曳調寬（300~640） */}
-                {chatBrowserOpen && isCrewActive && (
-                  <div
-                    className="shrink-0 w-1.5 cursor-col-resize hover:bg-stone-300/60 transition-colors absolute left-0 top-0 bottom-0 z-10"
-                    onMouseDown={e => {
-                      e.preventDefault();
-                      chatBrowserDragRef.current = { startX: e.clientX, startW: chatPanelWidth };
-                      const onMove = (ev: MouseEvent) => {
-                        const d = chatBrowserDragRef.current;
-                        if (!d) return;
-                        const maxW = Math.max(320, window.innerWidth - 480);
-                        setChatPanelWidth(Math.min(maxW, Math.max(300, d.startW - (ev.clientX - d.startX))));
-                      };
-                      const onUp = () => {
-                        chatBrowserDragRef.current = null;
-                        window.removeEventListener("mousemove", onMove);
-                        window.removeEventListener("mouseup", onUp);
-                      };
-                      window.addEventListener("mousemove", onMove);
-                      window.addEventListener("mouseup", onUp);
-                    }}
-                  />
-                )}
                 </div>
               </div>
               );
@@ -3717,7 +3672,7 @@ ${gitLog[0] ? `**最近 commit：** ${gitLog[0].short} ${gitLog[0].subject}` : "
             >
               <EMDashboard
                 rootPath={rootPath}
-                theme={{ bg: tk.bg, bgMuted: tk.bgMuted, borderLight: tk.borderLight, accent: tk.accent, accentBg: tk.accentBg, text: tk.text }}
+                theme={{ bg: tk.bg, bgMuted: tk.bgMuted, borderLight: tk.borderLight, accent: tk.accent, accentBg: tk.accentBg, text: tk.text, accentBorder: tk.accentBorder }}
                 onStartCodeUnderstanding={startAiInitialize}
                 cuModalRequest={cuModalRequest}
                 codeUnderstanding={{ running: aiInitializing, steps: aiInitSteps }}
@@ -3810,7 +3765,7 @@ ${gitLog[0] ? `**最近 commit：** ${gitLog[0].short} ${gitLog[0].subject}` : "
                 style={{ display: activeMainTab?.type === "release-manager" ? undefined : "none" }}>
                 <ReleaseManagerPanel
                   rootPath={rootPath}
-                  theme={{ borderLight: tk.borderLight, accent: tk.accent }}
+                  theme={{ borderLight: tk.borderLight, accent: tk.accent, accentHover: tk.accentHover || tk.accent }}
                   onOpenEMDashboard={() => openMainTab({ id: DASHBOARD_TAB_ID, type: "em-dashboard", label: "EM 大總管", icon: "🎖️", closable: false })}
                 />
               </div>
@@ -3820,7 +3775,7 @@ ${gitLog[0] ? `**最近 commit：** ${gitLog[0].short} ${gitLog[0].subject}` : "
                 style={{ display: activeMainTab?.type === "handover" ? undefined : "none" }}>
                 <HandoverPanel
                   rootPath={rootPath}
-                  theme={{ borderLight: tk.borderLight, accent: tk.accent }}
+                  theme={{ borderLight: tk.borderLight, accent: tk.accent, accentHover: tk.accentHover || tk.accent }}
                   onOpenEMDashboard={() => openMainTab({ id: DASHBOARD_TAB_ID, type: "em-dashboard", label: "EM 大總管", icon: "🎖️", closable: false })}
                 />
               </div>
@@ -3830,7 +3785,7 @@ ${gitLog[0] ? `**最近 commit：** ${gitLog[0].short} ${gitLog[0].subject}` : "
                 style={{ display: activeMainTab?.type === "troubleshooting" ? undefined : "none" }}>
                 <TroubleshootingPanel
                   rootPath={rootPath}
-                  theme={{ borderLight: tk.borderLight, accent: tk.accent }}
+                  theme={{ borderLight: tk.borderLight, accent: tk.accent, accentHover: tk.accentHover || tk.accent }}
                 />
               </div>
             )}
@@ -3868,6 +3823,17 @@ ${gitLog[0] ? `**最近 commit：** ${gitLog[0].short} ${gitLog[0].subject}` : "
               <div key="tool:decisions" className="flex-1 flex flex-col min-w-0"
                 style={{ display: activeMainTab?.type === "decisions" ? undefined : "none" }}>
                 <DecisionLog projectRoot={rootPath} />
+              </div>
+            )}
+
+            {/* === QA Records Tab（keep mounted，切 tab 不重抓）=== */}
+            {mainTabs.some(t => t.type === "qa-records") && rootPath && (
+              <div key="tool:qa-records" className="flex-1 flex flex-col min-w-0"
+                style={{ display: activeMainTab?.type === "qa-records" ? undefined : "none" }}>
+                <QaRecords
+                  rootPath={rootPath}
+                  theme={{ bg: tk.bg, bgMuted: tk.bgMuted, borderLight: tk.borderLight, accent: tk.accent, accentBg: tk.accentBg, text: tk.text }}
+                />
               </div>
             )}
 

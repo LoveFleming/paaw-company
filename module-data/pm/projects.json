@@ -1,0 +1,82 @@
+[
+  {
+    "id": "strategy",
+    "name": "產品策略師",
+    "emoji": "🧭",
+    "agentId": "pm.strategy",
+    "duty": "產品定位、願景、北極星指標、版本路線圖與優先序仲裁",
+    "description": "產品定位、願景、北極星指標、版本路線圖與優先序仲裁",
+    "kind": "function",
+    "builtin": true,
+    "enabled": true
+  },
+  {
+    "id": "research",
+    "name": "用戶研究員",
+    "emoji": "🔍",
+    "agentId": "pm.research",
+    "duty": "用戶訪談整理、競品分析、市場趨勢、VOC 需求驗證",
+    "description": "用戶訪談整理、競品分析、市場趨勢、VOC 需求驗證",
+    "kind": "function",
+    "builtin": true,
+    "enabled": true
+  },
+  {
+    "id": "requirements",
+    "name": "需求管理師",
+    "emoji": "📋",
+    "agentId": "pm.requirements",
+    "duty": "backlog 排序、PRD/用戶故事撰寫、驗收條件定義",
+    "description": "backlog 排序、PRD/用戶故事撰寫、驗收條件定義",
+    "kind": "function",
+    "builtin": true,
+    "enabled": true
+  },
+  {
+    "id": "data",
+    "name": "數據分析師",
+    "emoji": "📊",
+    "agentId": "pm.data",
+    "duty": "KPI 追蹤、指標覆盤、A/B 結論解讀、異常警示",
+    "description": "KPI 追蹤、指標覆盤、A/B 結論解讀、異常警示",
+    "kind": "function",
+    "builtin": true,
+    "enabled": true
+  },
+  {
+    "id": "launch",
+    "name": "上市指揮官",
+    "emoji": "🚀",
+    "agentId": "pm.launch",
+    "duty": "發布計畫、上市公告文案、上市後檢討（post-launch review）",
+    "description": "發布計畫、上市公告文案、上市後檢討（post-launch review）",
+    "kind": "function",
+    "builtin": true,
+    "enabled": true
+  },
+  {
+    "id": "alignment",
+    "name": "對齊窗口",
+    "emoji": "🤝",
+    "agentId": "pm.alignment",
+    "duty": "跨部門會議記錄、決議追蹤、老闆需求緩衝與轉譯",
+    "description": "跨部門會議記錄、決議追蹤、老闆需求緩衝與轉譯",
+    "kind": "function",
+    "builtin": true,
+    "enabled": true
+  },
+  {
+    "id": "ai-portal",
+    "name": "AI 工廠入口",
+    "emoji": "🏭",
+    "agentId": "pm.ai-portal",
+    "goal": "12 月前上線一頁式入口，全處 200 人日常用它派工",
+    "owner": "Fleming",
+    "start": "2026-10-01",
+    "end": "2026-12-31",
+    "status": "🟢",
+    "builtin": false,
+    "enabled": true,
+    "createdAt": "2026-10-03T14:49:15.215Z"
+  }
+]

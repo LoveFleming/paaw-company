@@ -1,0 +1,92 @@
+[
+  {
+    "id": "grafana",
+    "name": "監控巡檢員",
+    "emoji": "📈",
+    "agentId": "sre.grafana",
+    "duty": "Grafana/Prometheus 巡檢、面板與告警盤點、數據源健康、產出巡檢報告",
+    "description": "Grafana/Prometheus 巡檢、面板與告警盤點、數據源健康、產出巡檢報告",
+    "kind": "function",
+    "builtin": true,
+    "enabled": true
+  },
+  {
+    "id": "incident",
+    "name": "告警處置官",
+    "emoji": "🚨",
+    "agentId": "sre.incident",
+    "duty": "事故分級與通報、止損、on-call 交接、事件時間線",
+    "description": "事故分級與通報、止損、on-call 交接、事件時間線",
+    "kind": "function",
+    "builtin": true,
+    "enabled": true
+  },
+  {
+    "id": "capacity",
+    "name": "容量規劃師",
+    "emoji": "📦",
+    "agentId": "sre.capacity",
+    "duty": "資源水位、擴縮容、成本與容量規劃",
+    "description": "資源水位、擴縮容、成本與容量規劃",
+    "kind": "function",
+    "builtin": true,
+    "enabled": true
+  },
+  {
+    "id": "release",
+    "name": "部署變更官",
+    "emoji": "🚀",
+    "agentId": "sre.release",
+    "duty": "部署流程、變更風險評估、回滾計畫、變更窗口",
+    "description": "部署流程、變更風險評估、回滾計畫、變更窗口",
+    "kind": "function",
+    "builtin": true,
+    "enabled": true
+  },
+  {
+    "id": "slo",
+    "name": "可靠性治理師",
+    "emoji": "🎯",
+    "agentId": "sre.slo",
+    "duty": "SLO/錯誤預算、可靠性覆盤、可靠性改善路線",
+    "description": "SLO/錯誤預算、可靠性覆盤、可靠性改善路線",
+    "kind": "function",
+    "builtin": true,
+    "enabled": true
+  },
+  {
+    "id": "postmortem",
+    "name": "事故覆盤師",
+    "emoji": "🧯",
+    "agentId": "sre.postmortem",
+    "duty": "postmortem 撰寫、action item 追蹤、同因事故防再發",
+    "description": "postmortem 撰寫、action item 追蹤、同因事故防再發",
+    "kind": "function",
+    "builtin": true,
+    "enabled": true
+  },
+  {
+    "id": "runbook",
+    "name": "Runbook 管理師",
+    "emoji": "📖",
+    "agentId": "sre.runbook",
+    "duty": "運維手冊/SOP、值班清單、演練腳本",
+    "description": "運維手冊/SOP、值班清單、演練腳本",
+    "kind": "function",
+    "builtin": true,
+    "enabled": true
+  },
+  {
+    "id": "api-gateway",
+    "name": "API Gateway",
+    "emoji": "🚪",
+    "agentId": "sre.api-gateway",
+    "goal": "對外 API 入口可用率 99.9%",
+    "owner": "Fleming",
+    "tier": "P0",
+    "status": "🟢",
+    "builtin": false,
+    "enabled": true,
+    "createdAt": "2026-10-13T06:29:59.728Z"
+  }
+]

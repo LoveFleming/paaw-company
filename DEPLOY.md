@@ -1,6 +1,6 @@
-# deploy15 — 2026-11-07（v2）
+# deploy15 — 2026-11-07（v3）
 
-**來源：** tPAAW dev `9fceca79`（orphan branch，路徑 = tPAAW 相對路徑，packages/ 全量 426 檔）
+**來源：** tPAAW dev `5c5e4534`（orphan branch，路徑 = tPAAW 相對路徑，packages/ 全量 426 檔）
 **上一版：** deploy14（dev `1436ee0d`，2026-11-05）
 
 ## 主題
@@ -15,6 +15,7 @@ Release Manager / Code Review 委員會 / QA 記錄 / API Tester 大改（**API-
 6. **Code Review 會議記錄頁 by API first**：API 分組 → 該 API 歷次會議；可切回依會議
 7. **API Tester 改版**：Postman 式多 request tab + APIs 平面列表 + AI 新增 payload
 8. Header 精簡：移除 ↻ 重新整理按鈕、副標、`.paaw/releases/` badge
+9. 修正：壞 baseline sha 明確報 400（原本靜默回空矩陣，誤導成無變更）
 
 ## Delta vs deploy14（14 檔，全部覆蓋即可）
 

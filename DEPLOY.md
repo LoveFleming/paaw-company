@@ -1,6 +1,6 @@
-# deploy15 — 2026-11-07（v6）
+# deploy15 — 2026-11-07（v7）
 
-**來源：** tPAAW dev `6783ee82`（orphan branch，路徑 = tPAAW 相對路徑，packages/ 全量 426 檔）
+**來源：** tPAAW dev `15c29b8a`（orphan branch，路徑 = tPAAW 相對路徑，packages/ 全量 426 檔）
 **上一版：** deploy14（dev `1436ee0d`，2026-11-05）
 
 ## 主題
@@ -19,7 +19,7 @@ Release Manager / Code Review 委員會 / QA 記錄 / API Tester 大改（**API-
 10. **CU 多語言**（gin / actix-web / spring-petclinic 真 OSS repo 實測）：
     - 測試檔判定含 Go/Python/Rust/Java 慣例（`_test.go`、`test_*.py`、`tests/` 目錄、`XxxTests.java`）
     - api-map 不再吃測試檔假 routes
-    - **manifest 多語言偵測**：CU context 自動讀 package.json / go.mod / Cargo.toml / pom.xml / build.gradle / requirements.txt / pyproject.toml，輸出 Language/Dependencies 給 prompt（原本只讀 package.json，非 Node 專案拿不到語言線索）
+    - **manifest 多語言偵測**（區段感知 Cargo 解析）：package.json / go.mod / Cargo.toml / pom.xml / build.gradle / requirements.txt / pyproject.toml
     - gen-api-map prompt 補 language-agnostic 說明
 
 ## Delta vs deploy14（18 檔）

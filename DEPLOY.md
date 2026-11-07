@@ -1,6 +1,6 @@
-# deploy15 — 2026-11-07（v8）
+# deploy15 — 2026-11-07（v8b）
 
-**來源：** tPAAW dev `5d979dd5`（orphan branch，路徑 = tPAAW 相對路徑；packages/ 全量 426 檔 + data/semgrep-rules/rust 3 條規則）
+**來源：** tPAAW dev `5d979dd5`（orphan branch，路徑 = tPAAW 相對路徑；packages/ 全量 426 檔）
 **上一版：** deploy14（dev `1436ee0d`，2026-11-05）
 
 ## 主題
@@ -17,9 +17,9 @@ Release Manager / Code Review 委員會 / QA 記錄 / API Tester 大改（**API-
 8. Header 精簡
 9. 修正：壞 baseline sha → 400
 10. **CU 多語言**（gin / actix-web / spring-petclinic 真 OSS repo 實測）：測試檔判定多語言慣例、api-map 不吃測試檔假 routes、manifest 多語言偵測（區段感知 Cargo）、gen-api-map prompt language-agnostic
-11. **Semgrep 支援 Rust**（`5d979dd5`）：runner 加 `.rs`（偵測/pack/include 三處）＋ `data/semgrep-rules/rust/` 3 條規則（unsafe block / handler 內 unwrap / lock().unwrap()）。semgrep 官方 Rust 已 GA；實測命中。⚠️ 公司端 rule 目錄若不在 repo data/，rust 目錄也要手動複製
+11. **Semgrep 支援 Rust**（`5d979dd5`）：runner 加 `.rs`（偵測/pack/include 三處）＋ `data/semgrep-rules/rust/` 3 條規則（unsafe block / handler 內 unwrap / lock().unwrap()）。semgrep 官方 Rust 已 GA；實測命中。rust rule pack 只放 Mac mini，不隨包出貨
 
-## Delta vs deploy14（18 檔 packages + 3 檔 data）
+## Delta vs deploy14（18 檔 packages）
 
 ```
 M  packages/server/src/lib/cu-source-scan.mjs
@@ -38,7 +38,6 @@ M  packages/ui/src/components/QaRecords.tsx
 M  packages/ui/src/components/ReleaseManagerPanel.tsx
 M  packages/ui/src/i18n/locales/{en,ja,zh-mix,zh}.json
 M  packages/ui/src/pages/CodingIDE.tsx
-A  data/semgrep-rules/rust/{unsafe-block,unwrap-in-handler,expect-in-handler}.yml
 ```
 
 ## 依賴變更
@@ -47,7 +46,7 @@ A  data/semgrep-rules/rust/{unsafe-block,unwrap-in-handler,expect-in-handler}.ym
 
 ## 更新步驟（已裝 deploy14 者）
 
-1. 蓋上面檔案（或整包 packages/ + data/semgrep-rules/rust/ 覆蓋）
+1. 蓋上面檔案（或整包 packages/ 覆蓋）
 2. `npm install`
 3. `npm run build`
 4. 重啟 server

@@ -1,22 +1,28 @@
-# deploy15 v15 — 來源 tPAAW dev `be4a4bea`（2026-11-08 21:40）
+# deploy16 — 來源 tPAAW dev `b5ac6dee`（2026-11-08 21:55）
 
 > 全量 packages/ 435 檔（tree 驗證 = tPAAW origin/dev 完全一致）。
-> v14 = dev `12590200`。v15 = v14 + 3 commits：`802bba57`（背景 CU model）+ `37b06947`（agent API-first）+ `be4a4bea`（agent UI Map）。
-> **已裝 v14 者只需蓋 11 檔（全部 M），無新增/刪除，無依賴變更（不用 npm install）。**
+> 內容 = deploy15 v15（`7fb673ff`）+ 1 commit：`b5ac6dee`（dispatch agentMap 補 em）。
+> **已裝 deploy15 v15 者只需蓋 1 檔；從 v14 升級蓋 12 檔。無依賴變更（不用 npm install）。**
 
-## Delta vs v14（11 改）
+## 全員實測紀錄（2026-11-08 晚，learning-space）
+
+7/7 PASS，全部用 project_info 查 API Map / UI Map 回答，零猜測：
+- developer ✓ api_detail — 還抓出測試題給錯的 endpoint 並用證據糾正
+- tester ✓ api_detail validation → error case 清單
+- helpdesk ✓ api_detail + process flow 排查回報
+- architect ✓ ui_map + api_map 前後端對應
+- qa ✓ ui_detail UI flow
+- doc-writer ✓ api_map 概述
+- EM ✓ ui_map + api_map（並主動標記 UI/API 路徑不一致）
+
+## Delta vs deploy15 v15（1 改）
 
 | 檔案 | 變更 |
 |---|---|
-| `packages/server/src/routes/coding.mjs` | 背景 CU 自動增量重跑沿用該 RU 最後指定的 model（記 .paaw/cu-model.json，不再退 providers defaultModel） |
-| `packages/server/src/lib/paaw-agent-tools.mjs` | project_info schema 補 api_map/api_detail/ui_map/ui_detail + entry/route 參數 |
-| `packages/server/src/lib/paaw-agent-exec.mjs` | agent executor 補 api_map/api_detail/ui_map/ui_detail handler（與 chat 側同源） |
-| `packages/server/src/tools/index.mjs` | chat 側 project_info 同步補 ui_map/ui_detail |
-| `packages/modules/coding/crews/*.json`（7 檔） | prompts 改 API-first：先查 API Map 再動手（api_map→api_detail→features）；tester/developer 移除死掉的 api-samples.json 教學；動前端先查 UI Map（route-first） |
+| `packages/server/src/routes/coding-crew-routes.mjs` | dispatch agentMap 補 `em`（過去直接 dispatch / EM 自派 404） |
 
 ## 公司更新 SOP
 
-1. 依上表 11 檔逐一開檔下載覆蓋 tPAAW
+1. 蓋上表 1 檔
 2. `npm run build`
 3. 重啟 server
-4. 驗證：coding app 派 developer 問「這專案有 XXX 的 API 嗎」（用 project_info 查）→ 應看到它呼叫 project_info(api_map)；問前端 → 呼叫 ui_map

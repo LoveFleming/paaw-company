@@ -705,6 +705,32 @@ export default async function releaseRoutes(req, res, next) {
     return true;
   }
 
+  // GET page-inventory — Page Route 盤點（deterministic：多框架 route 發現 + components/unit/e2e/API 關聯；2026-11-07 Fleming 前端 API-first）
+  if (url === "/api/coding-releases/page-inventory" && method === "GET") {
+    if (!projectPath || !existsSync(projectPath)) { // nosemgrep: detect-non-literal-fs-filename — local-first：使用者自選專案根目錄（localhost 單人工具）
+      return res.status(400).json({ error: "path required" });
+    }
+    try {
+      const { buildPageInventory } = await import("../lib/page-inventory.mjs");
+      const { readApiFeatures, readUiFeatures } = await import("../lib/coding-db/reads.mjs");
+      const apis = readApiFeatures(projectPath);
+      const inv = buildPageInventory(projectPath, apis);
+      // join CU UI Map 的語意（頁面名稱/分類）— CU 沒跑過就純 deterministic 呈現
+      try {
+        const uis = readUiFeatures(projectPath) || [];
+        const byRoute = new Map(uis.map((u) => [u.route, u]));
+        for (const r of inv.rows) {
+          const u = byRoute.get(r.route);
+          if (u) { r.name = u.name; r.category = u.category; }
+        }
+      } catch {}
+      res.json({ ok: true, ...inv, generatedAt: new Date().toISOString() });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+    return true;
+  }
+
   if (url === "/api/coding-releases/evidence-by-api" && method === "GET") {
     if (!projectPath || !existsSync(projectPath)) return res.status(400).json({ error: "path required" }); // nosemgrep: detect-non-literal-fs-filename — local-first
     try {

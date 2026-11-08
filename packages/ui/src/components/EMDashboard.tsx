@@ -7,6 +7,7 @@
  */
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import API_BASE from "../api";
+import DispatchWizard from "./DispatchWizard";
 import ChatMessages from "./ChatMessages"; // kept for reference — EM chat now uses custom rich renderer
 import ModelSelector from "./ModelSelector";
 import { stableStringify, cn } from "../utils";
@@ -82,6 +83,8 @@ interface EMDashboardProps {
 }
 
 export default function EMDashboard({ rootPath, theme: tk, onStartCodeUnderstanding, codeUnderstanding, onDispatchToCrew, openMainTab, adRefreshTrigger = 0, model, onModelChange, cuModalRequest = 0, prefillMessage, onOpenDispatchReports }: EMDashboardProps) {
+  // 🚀 派工精靈（2026-11-07 Fleming）
+  const [showDispatchWizard, setShowDispatchWizard] = useState(false);
   // ── EM Profile (avatar from crew API) ──
   const [emProfile, setEmProfile] = useState<{ codename?: string; imageUrl?: string; emoji?: string }>({});
   useEffect(() => {
@@ -750,6 +753,7 @@ export default function EMDashboard({ rootPath, theme: tk, onStartCodeUnderstand
 
   return (
     <>
+    {showDispatchWizard && <DispatchWizard rootPath={rootPath} theme={tk} onClose={() => setShowDispatchWizard(false)} />}
     <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
       {/* 2026-08-29: 兩個 view 常駐掛載，用 hidden 切換 — 保留雙方 scroll 位置與元件狀態 */}
       <div className="flex-1 flex flex-col min-w-0 min-h-0">
@@ -770,6 +774,20 @@ export default function EMDashboard({ rootPath, theme: tk, onStartCodeUnderstand
             </div>
             <div className="flex items-center gap-1 shrink-0">
               {/* 2026-09-12 Fleming：agent chat icon 排統一 accent 色外框，跟 CodingIDE 主 chat / 林雨晴視窗一致 */}
+                            {/* 🚀 派工精靈（2026-11-07） */}
+              <button
+                onClick={() => setShowDispatchWizard(true)}
+                className="text-xs px-2 py-1 rounded-lg border transition-colors hover:bg-stone-50"
+                style={{ borderColor: tk.accentBorder || tk.accent, color: tk.accent }}
+                title={t("dw.title")}
+              >{t("dw.title")}</button>
+              {/* 2026-11-08 Fleming：CU 入口統一到派工旁邊（stale 提示 bar 退休 — 過期白動背景重跑）*/}
+              <button
+                onClick={() => { loadPersistedSteps(); setShowCUModal(true); }}
+                className="text-xs px-2 py-1 rounded-lg border transition-colors hover:bg-stone-50"
+                style={{ borderColor: tk.accentBorder || tk.accent + "99", color: tk.accent }}
+                title="🧠 Code Understanding"
+              >🧠</button>
               {/* EM Settings */}
               <button
                 onClick={() => { if (!showEmConfig) fetchEmConfig(); setShowEmConfig(!showEmConfig); }}
@@ -1157,26 +1175,6 @@ export default function EMDashboard({ rootPath, theme: tk, onStartCodeUnderstand
               <button onClick={() => { loadPersistedSteps(); setShowCUModal(true); }}
                 className="shrink-0 px-2 py-0.5 rounded bg-emerald-600 text-white hover:bg-emerald-700 font-bold"
               >🧠 Code Understanding</button>
-            </>
-          )}
-          {cuPhase === "stale" && (
-            <>
-              <span className="text-orange-700 truncate flex-1" title={`${t("cu.stale.label")}（${new Date(cuMeta?.codeLastModified || "").toLocaleDateString()}）${staleManual > 0 ? `；${staleManual} ${t("cu.stale.manual")}（${t("cu.stale.manualDetail")}）` : ""}`}>
-                ⚠️ {t("cu.stale.label")}（{new Date(cuMeta?.codeLastModified || "").toLocaleDateString()}）
-                {staleMechanical > 0 && <>，{staleMechanical} {t("cu.stale.mechanical")}</>}
-                {staleSmart > 0 && <>，{staleSmart} {t("cu.stale.smart")}</>}
-              </span>
-              {/* 2026-10-31 Fleming：機械層改 server 背景自動重掃（cu-status 偵測 stale 即掃）— 按鈕退休 */}
-              {staleMechanical > 0 && (
-                <span className="shrink-0 px-2 py-0.5 rounded bg-orange-50 text-orange-500 text-xs">
-                  {cuMeta?.mechanicalAutoRescan ? "🔄 機械層自動重掃中（背景）" : "⚡ 機械層重掃排程中"}
-                </span>
-              )}
-              {staleSmart > 0 && (
-                <button onClick={() => { loadPersistedSteps(); setShowCUModal(true); }}
-                  className="shrink-0 px-2 py-0.5 rounded bg-stone-100 text-stone-600 hover:bg-stone-200 font-bold"
-                >🧠 開啟 CU 視窗重跑</button>
-              )}
             </>
           )}
           {cuPhase === "done" && (

@@ -1,6 +1,6 @@
 # deploy25 — 2026-11-22（Evidence 實跑數字 + CU 分流 + 差異摘要 + 多語言偵測）
 
-來源：tPAAW dev `e1e06f6c1`（orphan commit，只含 `packages/**`，路徑 = tPAAW 相對路徑）
+來源：tPAAW dev `87876ad1f`（orphan commit，只含 `packages/**`，路徑 = tPAAW 相對路徑）
 
 ## 這一包是什麼
 
@@ -32,3 +32,7 @@
 4. Import 新 RU（無 `.paaw`）→ 跳 3 步 onboarding 含 CU；舊 RU → 2 步
 
 完整清單：GitHub 上本 branch 對 deploy24 的 compare。
+
+## 追加（同日晚間）
+
+- 未 close 的 RR 顯示 draft（不顯預估版號 v18，避免誤解）；info 快照內加 status: draft 欄位；差異摘要標頭去版號
